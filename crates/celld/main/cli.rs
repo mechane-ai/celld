@@ -60,10 +60,7 @@ impl Action {
     /// with whatever the process happened to warn about at startup, which is
     /// how this was found -- an allocator warning landed in front of a value.
     pub(crate) fn stdout_is_data(&self) -> bool {
-        !matches!(
-            self,
-            Self::Run(_) | Self::Dev(_) | Self::Help | Self::Version
-        )
+        !matches!(self, Self::Run(_) | Self::Dev(_))
     }
 }
 
