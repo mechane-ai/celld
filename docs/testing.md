@@ -35,6 +35,12 @@ It releases two RPC continuations together, then checks that both sequences of
 alarm transactions finish and preserve their committed alarm. Its deadline bounds
 a hung runtime; the fixture uses no sleep to order the calls.
 
+`node crates/celld/tests/tcp_ownership.mjs target/debug/celld` also needs OpenSSL.
+It resumes one event's TCP connection or TLS upgrade during another event's
+checkpoint, then verifies that an echo still completes after that other event
+returns. Loopback barriers order the calls, and the temporary certificate and key
+are removed with the fixture.
+
 The container-image regression also needs a working Docker engine:
 
 ```sh
