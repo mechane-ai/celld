@@ -217,11 +217,15 @@ pub(super) fn op_tcp_connect(
         Ok(request) => request,
         Err(error) => return loader_throw(scope, &format!("connect(): {error}")),
     };
-    // The id exists before the connection does, so the request context
-    // can own the socket even if the event ends mid-connect.
+    // V8 can run this reaction during another event's checkpoint. Resource
+    // ownership follows the reaction, or that other event closes its socket.
+    let Some(context) = current_reaction_or_untracked_io_context(scope) else {
+        return loader_throw(scope, "Cannot open a socket from a retired event");
+    };
+    // The event owns the id even while the connection is still pending.
     let id = next_id();
-    current_context().tcp_sockets.lock().unwrap().push(id);
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
+    context.tcp_sockets.lock().unwrap().push(id);
+    let gate = egress_gate_request(&context, celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
         let stream = tokio::net::TcpStream::connect((request.hostname.as_str(), request.port))
@@ -350,9 +354,12 @@ pub(super) fn op_tcp_starttls(
         Ok(request) => request,
         Err(error) => return loader_throw(scope, &format!("startTls(): {error}")),
     };
+    let Some(context) = current_reaction_or_untracked_io_context(scope) else {
+        return loader_throw(scope, "Cannot upgrade a socket from a retired event");
+    };
     let new_id = next_id();
-    current_context().tcp_sockets.lock().unwrap().push(new_id);
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
+    context.tcp_sockets.lock().unwrap().push(new_id);
+    let gate = egress_gate_request(&context, celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
         // The plaintext socket remains registered while the gate waits so the
