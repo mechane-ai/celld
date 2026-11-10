@@ -3671,6 +3671,10 @@ impl InFlight {
         self.reply.is_none()
             && self.gated_reply.is_none()
             && self.background.is_none()
+            // A completed cell event retains its ordinary native I/O. Its
+            // continuations can still take gates during another event's turn.
+            // Context-owned pumps must retire without waiting for their close.
+            && !self.has_cell_handler_ops()
             // A block that holds the gate is still this event's work:
             // retiring would close the sockets its callback may still read.
             && !self.holds_gate()
@@ -3678,6 +3682,14 @@ impl InFlight {
             // event's turn. Retain this event until that block releases its
             // claim, or retirement closes resources the callback still uses.
             && self.context.retire_without_cross_entry_gate()
+    }
+
+    fn has_cell_handler_ops(&self) -> bool {
+        self.completed_cell_event
+            && self
+                .ops
+                .iter()
+                .any(|id| !self.io_context_ops.contains(id) && !self.unrefed_ops.contains(id))
     }
 
     /// Why the event failed, when a sampled trace captured it.

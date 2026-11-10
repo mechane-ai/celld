@@ -14,7 +14,13 @@ const binary = resolve(repository, process.argv[2] || "target/debug/celld");
 await access(binary, constants.X_OK);
 const directory = await mkdtemp(join(tmpdir(), "celld-storage-transactions-"));
 const pending = [];
-const barrier = createServer((_request, response) => {
+const held = new Set();
+const barrier = createServer((request, response) => {
+  if (request.url === "/background") {
+    held.add(response);
+    response.once("close", () => held.delete(response));
+    return;
+  }
   pending.push(response);
   if (pending.length === 2) {
     for (const peer of pending.splice(0)) peer.end("released");
@@ -69,8 +75,13 @@ try {
   assert.equal(response.status, 200, text);
   assert.deepEqual(JSON.parse(text), { completed: [true, true], alarm: alarmTime });
   assert.equal(pending.length, 0, "the fixture holds no response while transactions finish");
-  console.log("concurrent storage transactions complete with the committed alarm");
+  const background = await fetch(`${origin}/background`, { signal: AbortSignal.timeout(10000) });
+  const backgroundBody = await background.text();
+  assert.equal(background.status, 200, backgroundBody);
+  assert.deepEqual(JSON.parse(backgroundBody), { alarm: alarmTime });
+  console.log("concurrent and background storage transactions complete with committed alarms");
 } finally {
+  for (const response of held) response.end("released");
   let timeout;
   if (child?.pid && !exited) {
     const stop = (signal) => {
