@@ -34,6 +34,8 @@ node crates/celld/tests/storage_transactions.mjs target/debug/celld
 It releases two RPC continuations together, then checks that both sequences of
 alarm transactions finish and preserve their committed alarm. Its deadline bounds
 a hung runtime; the fixture uses no sleep to order the calls.
+It also resumes a completed cell event's pending I/O during another RPC and
+checks that its transaction can still commit while that originating I/O is alive.
 
 `node crates/celld/tests/tcp_ownership.mjs target/debug/celld` also needs OpenSSL.
 It resumes one event's TCP connection or TLS upgrade during another event's
