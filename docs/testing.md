@@ -23,6 +23,18 @@ Platform Tests. Before a release, we replay storage, SQL, alarm, stream,
 WebSocket, and lifecycle scenarios through the full `celld` binary in each
 deployment mode.
 
+The concurrent storage-transaction regression runs the real binary with a
+loopback-only fixture barrier. It needs Node.js and the same `esbuild` executable
+that `celld dev` requires. After building celld, run:
+
+```sh
+node crates/celld/tests/storage_transactions.mjs target/debug/celld
+```
+
+It releases two RPC continuations together, then checks that both sequences of
+alarm transactions finish and preserve their committed alarm. Its deadline bounds
+a hung runtime; the fixture uses no sleep to order the calls.
+
 ## Specification: exhaustive at small size
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the

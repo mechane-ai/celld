@@ -27,14 +27,14 @@
 //! across arbitrary user code — including real awaits like `fetch` — and
 //! whose entire purpose is that nothing else runs meanwhile.
 //!
-//! # Why there is no queue here
+//! # Acquisition order
 //!
-//! An earlier version of this file parked refused events in a `VecDeque` and
-//! returned them from `release`. That mirrored a queue the shell already
-//! owns: a cell's events arrive on its job channel, and an event the gate
-//! refuses is simply **left there**, in arrival order, until a later
-//! delivery attempt takes it. Modelling it twice bought nothing and cost the
-//! two structures agreeing.
+//! Acquisition tickets retain their call order while the shell owns sleeping
+//! tasks and wakeups. A release can wake an earlier waiter after a new caller
+//! has already reached the gate. Letting that caller overtake the waiter can
+//! deadlock storage transactions: the later transaction holds the gate while
+//! awaiting its serial predecessor, which needs the same gate to start.
+//! A retired waiter cancels its ticket so it cannot block later callers.
 //!
 //! # Acquiring and releasing a hold
 //!
@@ -48,6 +48,8 @@
 //!
 //! This is the decision half. The shell owns the delivery points and asks
 //! [`is_open`](InputGate::is_open) at each one; it never decides who runs.
+
+use std::collections::VecDeque;
 
 /// An event delivered to a cell: a request turn, an alarm, a subrequest
 /// response, a stream wakeup. The shell assigns the ids and only needs them
@@ -68,6 +70,7 @@ pub struct InputGate {
     /// block ends would admit another event while the outer ones still run,
     /// which a boolean would do.
     outstanding: u32,
+    waiting: VecDeque<EventId>,
 }
 
 impl InputGate {
@@ -80,7 +83,12 @@ impl InputGate {
     /// The one question a delivery point asks. The holder never asks it: it
     /// is already running, and its own continuations are not deliveries.
     pub fn is_open(&self) -> bool {
-        self.holder.is_none()
+        self.holder.is_none() && self.waiting.is_empty()
+    }
+
+    /// A queued handoff keeps the gate closed without having a holder yet.
+    pub fn is_held(&self) -> bool {
+        self.holder.is_some()
     }
 
     /// `event` entered a `blockConcurrencyWhile`. Shuts the gate, and
@@ -95,6 +103,13 @@ impl InputGate {
     pub fn acquire(&mut self, event: EventId) -> bool {
         match self.holder {
             None => {
+                if let Some(&first) = self.waiting.front() {
+                    if first != event {
+                        self.enqueue(event);
+                        return false;
+                    }
+                    self.waiting.pop_front();
+                }
                 self.holder = Some(event);
                 self.outstanding = 1;
                 true
@@ -103,11 +118,32 @@ impl InputGate {
                 self.outstanding += 1;
                 true
             }
-            Some(_) => false,
+            Some(_) => {
+                self.enqueue(event);
+                false
+            }
         }
     }
 
-    /// One of `event`'s blocks ended. Return true only if it opens the gate.
+    fn enqueue(&mut self, event: EventId) {
+        if !self.waiting.contains(&event) {
+            self.waiting.push_back(event);
+        }
+    }
+
+    /// Cancel a queued take. Wake the next waiter when the canceled ticket
+    /// headed a handoff that has no current holder.
+    #[must_use]
+    pub fn cancel_waiting(&mut self, event: EventId) -> bool {
+        let Some(index) = self.waiting.iter().position(|queued| *queued == event) else {
+            return false;
+        };
+        self.waiting.remove(index);
+        index == 0 && self.holder.is_none()
+    }
+
+    /// One of `event`'s blocks ended. Return true when its final hold ends;
+    /// queued acquisition tickets still keep the delivery gate closed.
     ///
     /// A callback can finish after its hold was abandoned, including after
     /// another event took the gate. That stale release changes nothing:
@@ -141,5 +177,60 @@ impl InputGate {
         self.holder = None;
         self.outstanding = 0;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InputGate;
+
+    #[test]
+    fn queued_acquisition_cannot_be_overtaken() {
+        let mut gate = InputGate::new();
+        assert!(gate.acquire(1));
+        assert!(!gate.acquire(2));
+        assert!(gate.release(1));
+        assert!(!gate.is_open());
+        assert!(!gate.acquire(3));
+        assert!(gate.acquire(2));
+        assert!(gate.release(2));
+        assert!(!gate.acquire(4));
+        assert!(gate.acquire(3));
+        assert!(gate.release(3));
+        assert!(gate.acquire(4));
+        assert!(gate.release(4));
+        assert!(gate.is_open());
+    }
+
+    #[test]
+    fn canceled_handoff_ticket_does_not_strand_followers() {
+        let mut gate = InputGate::new();
+        assert!(gate.acquire(1));
+        assert!(!gate.acquire(2));
+        assert!(!gate.acquire(3));
+        assert!(gate.release(1));
+        assert!(gate.cancel_waiting(2));
+        assert!(!gate.is_open());
+        assert!(gate.acquire(3));
+        assert!(!gate.cancel_waiting(2));
+        assert!(gate.release(3));
+        assert!(gate.is_open());
+    }
+
+    #[test]
+    fn canceling_waiter_preserves_nested_holder() {
+        let mut gate = InputGate::new();
+        assert!(gate.acquire(1));
+        assert!(gate.acquire(1));
+        assert!(!gate.acquire(2));
+        assert!(!gate.cancel_waiting(2));
+        assert!(!gate.release(1));
+        assert!(!gate.is_open());
+        assert!(!gate.acquire(3));
+        assert!(gate.release(1));
+        assert!(gate.acquire(3));
+        assert!(!gate.release(1));
+        assert!(gate.release(3));
+        assert!(gate.is_open());
     }
 }

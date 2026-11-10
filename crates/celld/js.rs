@@ -1097,9 +1097,9 @@ impl CellGate {
         owner: Option<u64>,
         origin: &mut Option<CrossEntryGateClaim>,
     ) -> bool {
-        let was_open = self.gate.is_open();
+        let was_held = self.gate.is_held();
         let taken = self.gate.acquire(event);
-        if taken && was_open {
+        if taken && !was_held {
             self.set_holder(owner, origin.take());
         }
         taken
@@ -1293,9 +1293,8 @@ fn acquire_cell_gate(
     }
 }
 
-/// Wake everything waiting on `cell`'s gate. Each re-checks and re-queues if
-/// another block took the gate first, so waking all of them is correct and
-/// the order they resume in is theirs to lose, not this function's to keep.
+/// Wake everything waiting on `cell`'s gate. The core's acquisition tickets
+/// preserve order even when their tasks resume in a different order.
 fn wake_gate_waiters(cell: &str, outcome: Result<(), String>) {
     let waiters = gate_waiters().lock().unwrap().remove(cell);
     for wake in waiters.into_iter().flatten() {
@@ -9593,9 +9592,10 @@ fn op_gate_acquire(
     struct Queued {
         cell: String,
         owner: Option<u64>,
+        event: celld_logic::gate::EventId,
     }
     impl Queued {
-        fn new(cell: String, owner: Option<u64>) -> Self {
+        fn new(cell: String, owner: Option<u64>, event: celld_logic::gate::EventId) -> Self {
             if let Some(owner) = owner {
                 *cell_gates()
                     .lock()
@@ -9607,31 +9607,36 @@ fn op_gate_acquire(
                     .or_default() += 1;
                 GATE_ENGAGEMENTS.fetch_add(1, Ordering::Relaxed);
             }
-            Self { cell, owner }
+            Self { cell, owner, event }
         }
     }
     impl Drop for Queued {
         fn drop(&mut self) {
-            let Some(owner) = self.owner else {
-                return;
-            };
             let mut gates = cell_gates().lock().unwrap();
-            let remove = if let Some(gate) = gates.get_mut(&self.cell) {
-                if let Some(count) = gate.queued.get_mut(&owner) {
-                    *count -= 1;
-                    if *count == 0 {
-                        gate.queued.remove(&owner);
+            let (remove, wake) = if let Some(gate) = gates.get_mut(&self.cell) {
+                let wake = gate.gate.cancel_waiting(self.event);
+                if let Some(owner) = self.owner {
+                    if let Some(count) = gate.queued.get_mut(&owner) {
+                        *count -= 1;
+                        if *count == 0 {
+                            gate.queued.remove(&owner);
+                        }
                     }
                 }
-                gate.is_unused()
+                (gate.is_unused(), wake)
             } else {
-                false
+                (false, false)
             };
             if remove {
                 gates.remove(&self.cell);
             }
             drop(gates);
-            GATE_ENGAGEMENTS.fetch_sub(1, Ordering::Relaxed);
+            if self.owner.is_some() {
+                GATE_ENGAGEMENTS.fetch_sub(1, Ordering::Relaxed);
+            }
+            if wake {
+                wake_gate_waiters(&self.cell, Ok(()));
+            }
         }
     }
     let mut origin = if Arc::ptr_eq(&context, &owner_context) {
@@ -9652,7 +9657,7 @@ fn op_gate_acquire(
             mut gate,
             mut retirement,
         } => {
-            let queued = Queued::new(cell.clone(), owner);
+            let queued = Queued::new(cell.clone(), owner, event);
             let context = Arc::downgrade(&owner_context);
             asyncrt::enqueue_io_context(async move {
                 let _queued = queued;
