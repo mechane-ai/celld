@@ -90,6 +90,13 @@ jobs:
             node crates/celld/tests/storage_transactions.mjs target/release/celld \
             2>&1 | tee out/storage-transactions.log
 
+      - name: Check TCP resource ownership on candidate bytes
+        run: |
+          set -euo pipefail
+          npm exec --yes --package=esbuild@0.25.12 -- \
+            node crates/celld/tests/tcp_ownership.mjs target/release/celld \
+            2>&1 | tee out/tcp-ownership.log
+
       - name: Check Docker runtime on candidate bytes
         if: runner.os == 'Linux'
         run: |
@@ -132,7 +139,7 @@ jobs:
               'operatingSystem': platform.platform(),
               'compiler': command('rustc', '-Vv'),
               'cargo': command('cargo', '-V'),
-              'runtimeCheckTools': {'node': command('node', '--version'), 'npm': command('npm', '--version'), 'esbuild': '0.25.12'},
+              'runtimeCheckTools': {'node': command('node', '--version'), 'npm': command('npm', '--version'), 'esbuild': '0.25.12', 'openssl': command('openssl', 'version')},
               'cargoLockSHA256': digest('Cargo.lock'),
               'profile': 'release',
               'buildCommand': 'cargo build --release --locked',
@@ -146,6 +153,7 @@ jobs:
               'checks': [
                   {'name': 'retained Rust compatibility cases', 'outcome': 'passed', 'evidence': 'rust-tests.log', 'evidenceSHA256': digest('out/rust-tests.log')},
                   {'name': 'concurrent storage transactions on candidate bytes', 'outcome': 'passed', 'evidence': 'storage-transactions.log', 'evidenceSHA256': digest('out/storage-transactions.log')},
+                  {'name': 'TCP connect and startTLS resource ownership on candidate bytes', 'outcome': 'passed', 'evidence': 'tcp-ownership.log', 'evidenceSHA256': digest('out/tcp-ownership.log')},
               ],
               'publication': 'not published; CI candidate artifact only',
           }
