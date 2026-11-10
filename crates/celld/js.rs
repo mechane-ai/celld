@@ -9059,7 +9059,9 @@ fn op_fetch(
     // request it asked for.
     let cancellable = args.get(6).boolean_value(scope);
     let mut body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
-        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+        Some(stream_id) => match current_reaction_or_untracked_io_context(scope)
+            .and_then(|context| context.transfer_body_stream(stream_id))
+        {
             Some(guard) => guard,
             None => return loader_throw(scope, "fetch: the body stream is not owned"),
         },
@@ -11504,6 +11506,10 @@ impl IoContext {
         let Some(claim) = claim_http_stream(stream_id) else {
             return;
         };
+        self.own_body_stream_claim(stream_id, claim);
+    }
+
+    fn own_body_stream_claim(&self, stream_id: u64, claim: HttpStreamClaim) {
         let replaced = self.body_streams.lock().unwrap().insert(stream_id, claim);
         // Releasing a claim can drop an arbitrary source. Keep that work out
         // of the request-ownership lock.

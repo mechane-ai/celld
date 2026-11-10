@@ -34,6 +34,9 @@ let closed;
 let exited = false;
 const logs = [];
 const tlsErrors = [];
+const uploads = [];
+const waitingForR2 = [];
+let r2Ready = false;
 let phase = "setup";
 let opensslVersion;
 try {
@@ -53,7 +56,26 @@ try {
     "-out", request, "-subj", "/CN=localhost"], { stdio: "ignore" });
   execFileSync("openssl", ["x509", "-req", "-in", request, "-CA", caCertificate, "-CAkey", caKey,
     "-CAcreateserial", "-out", certificate, "-days", "1", "-sha256", "-extfile", extensions], { stdio: "ignore" });
-  const barrierPort = await listen(createHttpServer((_request, response) => {
+  const barrierPort = await listen(createHttpServer(async (request, response) => {
+    if (request.url === "/r2-ready") {
+      r2Ready = true;
+      for (const peer of waitingForR2.splice(0)) peer.end("ready");
+      response.end("ready");
+      return;
+    }
+    if (request.url === "/wait-r2-ready") {
+      if (r2Ready) response.end("ready");
+      else waitingForR2.push(response);
+      return;
+    }
+    if (request.url === "/upload") {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = Buffer.concat(chunks).toString();
+      uploads.push(body);
+      response.end(body);
+      return;
+    }
     held.add(response);
     response.once("close", () => held.delete(response));
   }));
@@ -71,6 +93,7 @@ try {
     compatibility_date: "2026-10-01",
     durable_objects: { bindings: [{ name: "OWNERS", class_name: "SocketOwner" }] },
     migrations: [{ tag: "v1", new_sqlite_classes: ["SocketOwner"] }],
+    r2_buckets: [{ binding: "FILES", bucket_name: "ownership-fixture" }],
     vars: { BARRIER_ORIGIN: `http://127.0.0.1:${barrierPort}`, TCP_PORT: String(tcpPort), TLS_PORT: String(tlsPort) },
   }));
   child = spawn(binary, ["dev", directory, "--port", String(port), "--no-watch", "--logs"], {
@@ -90,17 +113,22 @@ try {
     if (!ready) await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.ok(ready, `celld became ready\n${logs.join("")}`);
-  for (const mode of ["connect", "starttls"]) {
+  for (const mode of ["connect", "starttls", "r2"]) {
     phase = mode;
     const response = await fetch(`${origin}/${mode}`, { signal: AbortSignal.timeout(10000) });
     const body = await response.text();
     assert.equal(response.status, 200, `${mode}: ${body}\n${logs.join("")}`);
     assert.deepEqual(JSON.parse(body), { echo: "owned-echo" });
   }
-  console.log("TCP connect and startTLS retain their originating event across foreign turns");
+  const foreign = await fetch(`${origin}/r2-foreign`, { signal: AbortSignal.timeout(10000) });
+  assert.equal(foreign.status, 200);
+  assert.deepEqual(await foreign.json(), { refused: true });
+  assert.deepEqual(uploads, ["owned-echo"], "only the owning event sends its R2 body");
+  console.log("TCP and R2 streams retain their originating event; foreign body transfer stays refused");
 } catch (error) {
   throw new Error(`${phase}: ${error}\n${opensslVersion}\nTLS errors: ${JSON.stringify(tlsErrors)}\n${logs.join("")}`, { cause: error });
 } finally {
+  for (const response of waitingForR2) response.destroy();
   for (const response of held) response.end("released");
   let timer;
   if (child?.pid && !exited) {

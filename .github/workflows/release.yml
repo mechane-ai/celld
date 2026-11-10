@@ -90,7 +90,7 @@ jobs:
             node crates/celld/tests/storage_transactions.mjs target/release/celld \
             2>&1 | tee out/storage-transactions.log
 
-      - name: Check TCP resource ownership on candidate bytes
+      - name: Check TCP and R2 resource ownership on candidate bytes
         run: |
           set -euo pipefail
           npm exec --yes --package=esbuild@0.25.12 -- \
@@ -153,7 +153,7 @@ jobs:
               'checks': [
                   {'name': 'retained Rust compatibility cases', 'outcome': 'passed', 'evidence': 'rust-tests.log', 'evidenceSHA256': digest('out/rust-tests.log')},
                   {'name': 'concurrent storage transactions on candidate bytes', 'outcome': 'passed', 'evidence': 'storage-transactions.log', 'evidenceSHA256': digest('out/storage-transactions.log')},
-                  {'name': 'TCP connect and startTLS resource ownership on candidate bytes', 'outcome': 'passed', 'evidence': 'tcp-ownership.log', 'evidenceSHA256': digest('out/tcp-ownership.log')},
+                  {'name': 'TCP connect, startTLS and R2 body resource ownership on candidate bytes', 'outcome': 'passed', 'evidence': 'tcp-ownership.log', 'evidenceSHA256': digest('out/tcp-ownership.log')},
               ],
               'publication': 'not published; CI candidate artifact only',
           }

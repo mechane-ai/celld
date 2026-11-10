@@ -42,6 +42,9 @@ It resumes one event's TCP connection or TLS upgrade during another event's
 checkpoint, then verifies that an echo still completes after that other event
 returns. Loopback barriers order the calls, and the temporary certificate and key
 are removed with the fixture.
+The same fixture forwards an R2 body through native fetch after another RPC
+releases its originating continuation. It also verifies that another event cannot
+send that event's retained body.
 
 The container-image regression also needs a working Docker engine:
 

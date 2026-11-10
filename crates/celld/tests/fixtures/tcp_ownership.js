@@ -38,6 +38,40 @@ export class SocketOwner extends DurableObject {
     }
   }
 
+  async upload() {
+    this.ctx.waitUntil(fetch(`${this.env.BARRIER_ORIGIN}/hold`));
+    const object = await this.env.FILES.get("owned");
+    this.prepared.resolve();
+    await fetch(`${this.env.BARRIER_ORIGIN}/r2-ready`);
+    await this.beginConnect.promise;
+    this.connected.resolve();
+    await this.beginWrite.promise;
+    const response = await fetch(`${this.env.BARRIER_ORIGIN}/upload`, {
+      method: "POST",
+      headers: { "content-length": String(object.size) },
+      body: object.body,
+    });
+    return response.text();
+  }
+
+  async holdBody() {
+    this.ctx.waitUntil(fetch(`${this.env.BARRIER_ORIGIN}/hold`));
+    this.savedBody = (await this.env.FILES.get("owned")).body;
+    return true;
+  }
+
+  async refuseForeignBody() {
+    try {
+      await fetch(`${this.env.BARRIER_ORIGIN}/upload`, {
+        method: "POST",
+        body: this.savedBody,
+      });
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
   async ready() {
     await this.prepared.promise;
     return true;
@@ -60,7 +94,14 @@ export default {
     const mode = new URL(request.url).pathname.slice(1);
     if (mode === "health") return new Response("ready");
     const owner = env.OWNERS.get(env.OWNERS.idFromName(mode));
-    const result = owner.work(mode === "starttls");
+    if (mode === "r2" || mode === "r2-foreign")
+      await env.FILES.put("owned", "owned-echo");
+    if (mode === "r2-foreign") {
+      await owner.holdBody();
+      return Response.json({ refused: await owner.refuseForeignBody() });
+    }
+    const result = mode === "r2" ? owner.upload() : owner.work(mode === "starttls");
+    if (mode === "r2") await fetch(`${env.BARRIER_ORIGIN}/wait-r2-ready`);
     await Promise.race([owner.ready(), result]);
     await Promise.race([owner.open(), result]);
     await owner.write();
