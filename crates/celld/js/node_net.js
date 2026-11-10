@@ -4,7 +4,7 @@
   "use strict";
 
   const isIPv4 = (input) => {
-    const value = "" + input;
+    const value = `${input}`;
     const segments = value.split(".");
     return segments.length === 4 && segments.every((segment) =>
       /^(0|[1-9][0-9]{0,2})$/.test(segment) && Number(segment) <= 255
@@ -12,7 +12,7 @@
   };
 
   const isIPv6 = (input) => {
-    let value = "" + input;
+    let value = `${input}`;
     const zone = value.indexOf("%");
     if (zone !== -1) {
       if (!/^[0-9a-zA-Z.:-]+$/.test(value.slice(zone + 1))) return false;

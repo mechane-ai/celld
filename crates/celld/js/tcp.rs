@@ -106,25 +106,68 @@ fn build_tls_connector(extra_root: Option<Vec<u8>>) -> Result<tokio_rustls::TlsC
             .map_err(|error| format!("invalid extra TLS root: {error}"))?;
     }
     if let Some(path) = std::env::var_os("CELLD_EXTRA_CA_CERTS") {
-        use rustls::pki_types::pem::PemObject;
-
-        let certificates = rustls::pki_types::CertificateDer::pem_file_iter(&path)
-            .map_err(|error| format!("CELLD_EXTRA_CA_CERTS: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("CELLD_EXTRA_CA_CERTS: {error}"))?;
-        if certificates.is_empty() {
-            return Err("CELLD_EXTRA_CA_CERTS contains no certificates".into());
-        }
-        for certificate in certificates {
-            roots
-                .add(certificate)
-                .map_err(|error| format!("CELLD_EXTRA_CA_CERTS: {error}"))?;
-        }
+        add_extra_tls_roots(&mut roots, std::path::Path::new(&path))?;
     }
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
+}
+
+fn add_extra_tls_roots(
+    roots: &mut rustls::RootCertStore,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use rustls::pki_types::pem::PemObject;
+
+    let certificates = rustls::pki_types::CertificateDer::pem_file_iter(path)
+        .map_err(|error| format!("CELLD_EXTRA_CA_CERTS: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("CELLD_EXTRA_CA_CERTS: {error}"))?;
+    if certificates.is_empty() {
+        return Err("CELLD_EXTRA_CA_CERTS contains no certificates".into());
+    }
+    for certificate in certificates {
+        roots
+            .add(certificate)
+            .map_err(|error| format!("CELLD_EXTRA_CA_CERTS: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_extra_tls_roots;
+
+    #[test]
+    fn extra_ca_file_adds_roots_without_replacing_public_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("roots.pem");
+        std::fs::write(&path, include_bytes!("testdata/extra-ca.pem")).unwrap();
+        let mut roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let public_roots = roots.len();
+        add_extra_tls_roots(&mut roots, &path).unwrap();
+        assert_eq!(roots.len(), public_roots + 1);
+    }
+
+    #[test]
+    fn unusable_extra_ca_file_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("roots.pem");
+        let mut roots = rustls::RootCertStore::empty();
+        assert!(add_extra_tls_roots(&mut roots, &path).is_err());
+        for contents in [
+            "",
+            "not a certificate",
+            "-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(add_extra_tls_roots(&mut roots, &path).is_err());
+        }
+    }
 }
 
 async fn handshake(stream: Duplex, host: String) -> Result<Duplex, String> {
