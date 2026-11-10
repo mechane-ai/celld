@@ -221,7 +221,7 @@ The accepted top-level keys:
 - `d1_databases`, `kv_namespaces`, `queues`, `workflows`, and
   `r2_buckets`
 - `worker_loaders` and `containers`
-- `define` and `rules`
+- `define`, `rules`, `find_additional_modules`, and `base_dir`
 
 Any other top-level key, including `routes`, stops the deployment.
 
@@ -231,8 +231,14 @@ or `CompiledWasm`, and each glob must have the form `**/*.ext` or `*.ext`,
 because esbuild selects a loader by extension. Two rules that give one
 extension different types stop the deployment. celld already applies
 `CompiledWasm` to `**/*.wasm`, so only that type is valid for `.wasm`.
-`no_bundle` skips esbuild, so `no_bundle` with `define` or `rules` stops the
-deployment.
+`no_bundle` skips esbuild. With `find_additional_modules: true`, `rules`
+instead selects separate `ESModule` and `CompiledWasm` files below `base_dir`.
+Their bytes and relative names are preserved in the ordinary Worker isolate.
+This explicit mode does not collect JavaScript without a matching rule.
+Other unbundled module types, partial bundling, and `define` with `no_bundle`
+are refused. Without this opt-in, `no_bundle` with `rules` still stops the
+deployment. See [prebuilt Workers](wasm.md#prebuilt-workers) for the configuration
+and path restrictions.
 
 An asset-only project can omit `main`. `celld deploy` refuses an unsafe asset
 path, and `.assetsignore` requires Wrangler.

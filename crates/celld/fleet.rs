@@ -776,6 +776,7 @@ async fn load_worker_at_pointer(
         );
     }
     crate::protocol::validate_required_features(&manifest.required_features)?;
+    crate::protocol::validate_module_manifest(&manifest)?;
     crate::protocol::validate_queue_manifest(&manifest)?;
     // Old managed uploads can contain AI metadata without a required-feature
     // gate. Refuse it before loading code, rather than serve a missing binding.
@@ -816,6 +817,12 @@ async fn load_worker_at_pointer(
     for (module, bytes) in fetched {
         let entry = match module.kind {
             Some(ModuleKind::Wasm) => (module.name.clone(), ModuleSource::Wasm(bytes)),
+            Some(ModuleKind::EsModule) => (
+                module.name.clone(),
+                ModuleSource::EsModule(
+                    String::from_utf8(bytes.into()).context("deployment ES module is not UTF-8")?,
+                ),
+            ),
             None => (
                 format!("./{}", module.name),
                 ModuleSource::Text(
@@ -931,6 +938,12 @@ async fn load_worker_at_pointer(
     let containers = manifest.containers.clone();
     let fence_image = manifest.fence_image.clone();
     Ok(LoadedDeployment {
+        main_module_name: manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == crate::protocol::FEATURE_ES_MODULES_V1)
+            .then(|| manifest.main_module.clone())
+            .flatten(),
         options: WorkerConfigOptions {
             src,
             script_name: script_name.clone(),
@@ -962,6 +975,8 @@ async fn load_worker_at_pointer(
 
 pub struct LoadedDeployment {
     pub options: WorkerConfigOptions,
+    /// Typed inventories preserve the main module's base-directory-relative name.
+    pub main_module_name: Option<String>,
     pub script_name: String,
     pub version: String,
     pub prefix: String,

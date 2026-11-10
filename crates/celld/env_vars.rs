@@ -211,6 +211,7 @@ const REMOVED_PREFIX: (&str, &str) = (
 /// they cannot return a configuration error at the point of use. This pass
 /// makes those reads infallible without giving malformed values a default.
 pub fn validate() -> anyhow::Result<()> {
+    crate::container::host_service_ports()?;
     // Each entry carries its own empty-value rule, because whether `NAME=` was
     // inert is a property of the reader that went away and not of removal.
     for removed in REMOVED {

@@ -165,6 +165,14 @@ where
     tokio::time::timeout(remaining, future).await.ok()
 }
 
+async fn shutdown_containers_within(deadline: tokio::time::Instant) -> anyhow::Result<()> {
+    if celld::container::engine_if_ready().is_none() {
+        return Ok(());
+    }
+    before_process_deadline(deadline, celld::container::shutdown()).await
+        .ok_or_else(|| anyhow::anyhow!("container cleanup exceeded the process deadline; keep host-service ports owned until the same state directory reconciles"))?
+}
+
 /// Finish process-wide WebSocket frame work before connection tasks can
 /// unregister the sockets that receive those frames.
 async fn flush_shutdown_connections<Frames, Connections>(
@@ -3778,6 +3786,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .or_else(|| std::env::var_os("CELLD_WATCH"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
+    celld::container::configure(node.clone(), None, data_dir.clone());
     let mut deploy_agent = None;
     // The channel `POST /reload` and a managed notification nudge the pointer
     // watcher through. Without a deployment bucket the receiver is dropped
@@ -4035,6 +4044,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 FIRST_GENERATION,
                 DeploymentGraph::single(fleet::LoadedDeployment {
                     options,
+                    main_module_name: None,
                     script_name,
                     version: "local".to_string(),
                     prefix: script_path.clone(),
@@ -4106,6 +4116,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             };
             (None, ownership, peer_key, None, None)
         };
+    celld::container::reconcile_host_services().await?;
     if let Some(config) = &telemetry_config {
         let sink_bucket = match &config.sink {
             celld::telemetry::SinkChoice::Bucket => {
@@ -5259,7 +5270,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 && core_drained
             {
                 containers_reaped = true;
-                before_process_deadline(handoff_deadline, celld::container::shutdown()).await;
+                if let Err(error) = shutdown_containers_within(handoff_deadline).await {
+                    tracing::warn!(event = "container_cleanup_failed", %error);
+                }
                 continue;
             }
             celld::asyncrt::select! {
@@ -5464,7 +5477,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // The backstop for a handoff cut by its deadline: a cell left behind
     // must not leave its container running until the next start of this
     // node reaps it. Idempotent after the preserve drain's own call.
-    before_process_deadline(process_deadline, celld::container::shutdown()).await;
+    let container_cleanup = shutdown_containers_within(process_deadline).await;
+    if let Err(error) = &container_cleanup {
+        eprintln!("{error:#}");
+    }
     let flush_connections = async {
         while drain_connections.next().await.is_some() {}
         while connections.next().await.is_some() {}
@@ -5586,7 +5602,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         shutdown_accept_failure_test_active,
         "final log flush reached",
     );
-    exit_flushed(0);
+    exit_flushed(if container_cleanup.is_ok() { 0 } else { 1 });
 }
 
 use celld::machine::{

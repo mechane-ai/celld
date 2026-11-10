@@ -75,6 +75,20 @@ impl HostFile {
 
 /// The complete local-file surface used by celld and the LTX engine.
 pub trait FileSystem: Send + Sync {
+    /// Resolve native directory aliases before using a path as a resource owner.
+    fn canonicalize(&self, _path: &Path) -> io::Result<PathBuf> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the filesystem does not support native path identities",
+        ))
+    }
+    /// Create an owner-only file without following an existing path.
+    fn write_private(&self, _path: &Path, _bytes: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the filesystem does not support private native files",
+        ))
+    }
     /// Opens an anonymous read/write scratch file. The handle owns its storage,
     /// so cancellation and process exit cannot leave a compaction scratch file.
     /// Custom filesystems must implement this to compact oversized sources.
@@ -145,6 +159,29 @@ impl HostFileIo for DirectFile {
 
 #[allow(clippy::disallowed_methods)]
 impl FileSystem for DirectFileSystem {
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(path)
+    }
+    fn write_private(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            std::io::Write::write_all(&mut file, bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, bytes);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "private native files require Unix permissions",
+            ))
+        }
+    }
     fn temporary_file(&self, directory: Option<&Path>) -> io::Result<HostFile> {
         let file = match directory {
             Some(directory) => tempfile::tempfile_in(directory)?,
