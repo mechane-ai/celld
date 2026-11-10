@@ -33,7 +33,11 @@ let child;
 let closed;
 let exited = false;
 const logs = [];
+const tlsErrors = [];
+let phase = "setup";
+let opensslVersion;
 try {
+  opensslVersion = execFileSync("openssl", ["version"], { encoding: "utf8" }).trim();
   const key = join(directory, "key.pem");
   const certificate = join(directory, "certificate.pem");
   execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", certificate,
@@ -44,7 +48,9 @@ try {
     response.once("close", () => held.delete(response));
   }));
   const tcpPort = await listen(track(createTcpServer(echo)));
-  const tlsPort = await listen(track(createTlsServer({ key: await readFile(key), cert: await readFile(certificate) }, echo)));
+  const tls = track(createTlsServer({ key: await readFile(key), cert: await readFile(certificate) }, echo));
+  tls.on("tlsClientError", (error) => tlsErrors.push({ code: error.code, message: error.message }));
+  const tlsPort = await listen(tls);
   const reservation = createHttpServer();
   const port = await listen(reservation);
   await new Promise((resolve) => reservation.close(resolve));
@@ -75,6 +81,7 @@ try {
   }
   assert.ok(ready, `celld became ready\n${logs.join("")}`);
   for (const mode of ["connect", "starttls"]) {
+    phase = mode;
     const response = await fetch(`${origin}/${mode}`, { signal: AbortSignal.timeout(10000) });
     const body = await response.text();
     assert.equal(response.status, 200, `${mode}: ${body}\n${logs.join("")}`);
@@ -82,7 +89,7 @@ try {
   }
   console.log("TCP connect and startTLS retain their originating event across foreign turns");
 } catch (error) {
-  throw new Error(`${error}\n${logs.join("")}`, { cause: error });
+  throw new Error(`${phase}: ${error}\n${opensslVersion}\nTLS errors: ${JSON.stringify(tlsErrors)}\n${logs.join("")}`, { cause: error });
 } finally {
   for (const response of held) response.end("released");
   let timer;

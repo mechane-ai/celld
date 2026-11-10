@@ -61,8 +61,8 @@ export default {
     if (mode === "health") return new Response("ready");
     const owner = env.OWNERS.get(env.OWNERS.idFromName(mode));
     const result = owner.work(mode === "starttls");
-    await owner.ready();
-    await owner.open();
+    await Promise.race([owner.ready(), result]);
+    await Promise.race([owner.open(), result]);
     await owner.write();
     return Response.json({ echo: await result });
   },
