@@ -40,9 +40,19 @@ try {
   opensslVersion = execFileSync("openssl", ["version"], { encoding: "utf8" }).trim();
   const key = join(directory, "key.pem");
   const certificate = join(directory, "certificate.pem");
-  execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", certificate,
-    "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
-    "-addext", "basicConstraints=critical,CA:FALSE", "-addext", "extendedKeyUsage=serverAuth"], { stdio: "ignore" });
+  const caKey = join(directory, "ca.key");
+  const caCertificate = join(directory, "ca.pem");
+  const caConfiguration = join(directory, "ca.cnf");
+  const request = join(directory, "server.csr");
+  const extensions = join(directory, "server.ext");
+  await writeFile(caConfiguration, "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=ca\n[dn]\nCN=celld-tcp-fixture-ca\n[ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n");
+  await writeFile(extensions, "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256", "-keyout", caKey,
+    "-out", caCertificate, "-days", "1", "-config", caConfiguration], { stdio: "ignore" });
+  execFileSync("openssl", ["req", "-newkey", "rsa:2048", "-nodes", "-sha256", "-keyout", key,
+    "-out", request, "-subj", "/CN=localhost"], { stdio: "ignore" });
+  execFileSync("openssl", ["x509", "-req", "-in", request, "-CA", caCertificate, "-CAkey", caKey,
+    "-CAcreateserial", "-out", certificate, "-days", "1", "-sha256", "-extfile", extensions], { stdio: "ignore" });
   const barrierPort = await listen(createHttpServer((_request, response) => {
     held.add(response);
     response.once("close", () => held.delete(response));
@@ -66,7 +76,7 @@ try {
   child = spawn(binary, ["dev", directory, "--port", String(port), "--no-watch", "--logs"], {
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, CELLD_EXTRA_CA_CERTS: certificate },
+    env: { ...process.env, CELLD_EXTRA_CA_CERTS: caCertificate },
   });
   closed = new Promise((resolve) => child.once("close", () => { exited = true; resolve(); }));
   child.once("error", (error) => { exited = true; logs.push(String(error)); });
