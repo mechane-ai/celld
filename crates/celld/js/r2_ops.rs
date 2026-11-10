@@ -91,6 +91,9 @@ pub(super) fn op_r2_get(
     let key = args.get(1).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<GetRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 get options: {error}"));
+    let Some(context) = current_reaction_or_untracked_io_context(scope) else {
+        return loader_throw(scope, "Cannot read an R2 body from a retired event");
+    };
     let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {
         let request = request?;
@@ -111,6 +114,10 @@ pub(super) fn op_r2_get(
                 let stream_id = stream_service
                     .register_source(HttpStreamSource::Stream(blob.body))
                     .ok_or_else(|| format!("R2 get: {HTTP_STREAM_REGISTRATION_CLOSED}"))?;
+                let claim = stream_service
+                    .claim(stream_id)
+                    .ok_or_else(|| format!("R2 get: {HTTP_STREAM_REGISTRATION_CLOSED}"))?;
+                context.own_body_stream_claim(stream_id, claim);
                 serde_json::json!({
                     "state": "hit",
                     "object": object_json(&key, &blob.meta, Some(blob.range)),
