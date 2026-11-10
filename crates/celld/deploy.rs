@@ -18,8 +18,8 @@ use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
-    FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    FEATURE_D1_V1, FEATURE_ES_MODULES_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1,
+    FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod modules;
 mod python;
 
 /// Config keys we understand. Anything else is an error: refusing is
@@ -59,6 +60,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "worker_loaders",
     "containers",
     "no_bundle",
+    "find_additional_modules",
+    "base_dir",
     "define",
     "rules",
 ];
@@ -302,6 +305,7 @@ struct Project {
     /// esbuild. A Vite build has already bundled the Worker, and bundling it
     /// twice is what breaks that output.
     no_bundle: bool,
+    module_inventory: Option<modules::Inventory>,
     /// Entry relative to the project root. esbuild stamps this path into the
     /// bundle, so it must not depend on the working directory celld was
     /// invoked from — identical source would otherwise hash two ways.
@@ -634,12 +638,14 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 let bundle = std::fs::read(&path)
                     .with_context(|| format!("read entry point {}", path.display()))?;
                 let mut wasm = Vec::new();
-                collect_unbundled_wasm(
-                    path.parent().context("entry has no directory")?,
-                    "",
-                    &path,
-                    &mut wasm,
-                )?;
+                if project.module_inventory.is_none() {
+                    collect_unbundled_wasm(
+                        path.parent().context("entry has no directory")?,
+                        "",
+                        &path,
+                        &mut wasm,
+                    )?;
+                }
                 // Directory iteration order must not change deployment identity.
                 wasm.sort_by(|a, b| a.0.cmp(&b.0));
                 Ok(BundleOutput { bundle, wasm })
@@ -650,14 +656,30 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .transpose()?;
     let bundled_in = started.elapsed();
 
-    // Both build paths emit one JS module and its sibling wasm modules.
-    let module_name = "index.js".to_string();
+    let module_name = project.module_inventory.as_ref().map_or_else(
+        || "index.js".to_string(),
+        |inventory| inventory.main.clone(),
+    );
     let (mut modules, wasm_modules) = match bundle {
         Some(output) => (vec![(module_name.clone(), output.bundle)], output.wasm),
         None => (Vec::new(), Vec::new()),
     };
     let wasm_names: BTreeSet<String> = wasm_modules.iter().map(|(name, _)| name.clone()).collect();
+    let mut module_kinds: BTreeMap<String, ModuleKind> = wasm_names
+        .iter()
+        .map(|name| (name.clone(), ModuleKind::Wasm))
+        .collect();
     modules.extend(wasm_modules);
+    if let Some(inventory) = &project.module_inventory {
+        module_kinds.insert(module_name.clone(), ModuleKind::EsModule);
+        for module in inventory.collect()? {
+            module_kinds.insert(module.name.clone(), module.kind);
+            modules.push((module.name, module.bytes));
+        }
+        // Module types affect execution even when the bytes and names match.
+        project.metadata["module_types"] = json!(module_kinds);
+        project.metadata["main_module"] = json!(module_name);
+    }
     // Identity is over the exact metadata bytes the manifest retains, so the
     // serialization happens once and is reused for both.
     let metadata_json = serde_json::to_vec(&project.metadata)?;
@@ -693,7 +715,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 name: name.clone(),
                 bytes: bytes.len(),
                 sha256: format!("{:x}", Sha256::digest(bytes)),
-                kind: wasm_names.contains(name).then_some(ModuleKind::Wasm),
+                kind: module_kinds.get(name).copied(),
             })
             .collect(),
         assets: asset_reference,
@@ -733,8 +755,11 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
             }
-            if !wasm_names.is_empty() {
+            if module_kinds.values().any(|kind| *kind == ModuleKind::Wasm) {
                 features.push(FEATURE_WASM_V1.to_string());
+            }
+            if project.module_inventory.is_some() {
+                features.push(FEATURE_ES_MODULES_V1.to_string());
             }
             if python_runtime {
                 features.push(FEATURE_PYTHON_WORKERS_V1.to_string());
@@ -1374,15 +1399,23 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             python::python_compat(object)
         })
         .transpose()?;
-    let bundle = read_bundle_config(object)?;
-    // `define` and `rules` describe the esbuild run, and `no_bundle` is the
-    // absence of one. Accepting both would produce a deployment that silently
-    // omits every substitution the config asks for, which is the failure the
-    // caller wrote those keys to prevent.
+    let module_inventory = modules::read(object, root, main.as_deref(), no_bundle)?;
+    if module_inventory.is_some() && python.is_some() {
+        bail!("additional module discovery requires a JavaScript entry");
+    }
+    let bundle = if module_inventory.is_some() {
+        BundleConfig::default()
+    } else {
+        read_bundle_config(object)?
+    };
+    // `define` requires esbuild. Only the explicit module inventory gives
+    // `rules` a meaning without esbuild; otherwise reject ignored build inputs.
     if no_bundle {
         let ignored: Vec<&str> = ["define", "rules"]
             .into_iter()
-            .filter(|key| object.contains_key(*key))
+            .filter(|key| {
+                object.contains_key(*key) && (*key != "rules" || module_inventory.is_none())
+            })
             .collect();
         if !ignored.is_empty() {
             bail!(
@@ -2022,6 +2055,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     Ok(Project {
         script_name,
         no_bundle,
+        module_inventory,
         entry: main,
         bundle,
         assets,

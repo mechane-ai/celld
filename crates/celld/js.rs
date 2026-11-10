@@ -2102,7 +2102,7 @@ impl WorkerConfig {
         self
     }
 
-    fn with_main_module_name(mut self, name: String) -> Self {
+    pub(crate) fn with_main_module_name(mut self, name: String) -> Self {
         self.main_module_name = name;
         self
     }
@@ -10773,7 +10773,7 @@ impl BundleTree {
         let mut nodes = HashMap::new();
         nodes.insert("/bundle".to_string(), BundleNode::Directory);
         let entry = std::iter::once((
-            ENTRY_MODULE_NAME,
+            config.main_module_name.as_str(),
             bytes::Bytes::copy_from_slice(config.src.as_bytes()),
         ));
         let modules = config.modules.iter().map(|(name, source)| {

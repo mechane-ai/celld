@@ -46,6 +46,14 @@ The same fixture forwards an R2 body through native fetch after another RPC
 releases its originating continuation. It also verifies that another event cannot
 send that event's retained body.
 
+`node crates/celld/tests/unbundled_modules.mjs target/debug/celld` deploys an
+unbundled module graph through the ordinary deployment path. A wrapper inherits
+a Durable Object from an unchanged sibling module that imports platform
+builtins, nested JavaScript, and Wasm. The fixture checks persisted RPC effects,
+lazy imports, exact source bytes inside the isolate, and rejection of missing,
+conflicting, unsupported, escaping, and symlinked modules. It needs only Node.js
+and celld; no bundler or Docker engine is used.
+
 The container-image regression also needs a working Docker engine:
 
 ```sh
