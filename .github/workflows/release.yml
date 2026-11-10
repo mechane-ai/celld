@@ -75,7 +75,9 @@ jobs:
           set -euo pipefail
           cargo build --release --locked
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
-          test "$(target/release/celld --version)" = "celld $version"
+          reported=$(target/release/celld --version)
+          printf 'Expected version: celld %s\nReported version: %s\n' "$version" "$reported"
+          test "$reported" = "celld $version"
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -87,6 +89,14 @@ jobs:
           npm exec --yes --package=esbuild@0.25.12 -- \
             node crates/celld/tests/storage_transactions.mjs target/release/celld \
             2>&1 | tee out/storage-transactions.log
+
+      - name: Check Docker image identities on candidate bytes
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          npm exec --yes --package=esbuild@0.25.12 -- \
+            node crates/celld/tests/container_images.mjs target/release/celld \
+            2>&1 | tee out/container-images.log
 
       - name: Package exact bytes and input manifest
         env:
@@ -138,6 +148,9 @@ jobs:
           }
           assert manifest['sourceCommit'] == os.environ['EXPECTED_COMMIT']
           assert manifest['sourceClean']
+          if target.endswith('-linux-gnu'):
+              manifest['runtimeCheckTools']['docker'] = command('docker', 'version', '--format', '{{.Server.Version}}')
+              manifest['checks'].append({'name': 'concurrent Docker image identities on candidate bytes', 'outcome': 'passed', 'evidence': 'container-images.log', 'evidenceSHA256': digest('out/container-images.log')})
           pathlib.Path(f'out/manifest-{target}.json').write_text(json.dumps(manifest, indent=2) + '\n')
           PY
 
