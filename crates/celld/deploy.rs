@@ -787,6 +787,19 @@ fn run_engine(args: &[&str], what: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn image_content(image: &str) -> anyhow::Result<String> {
+    run_engine(
+        &[
+            "image",
+            "inspect",
+            "--format",
+            "{{json .RootFS.Layers}}{{json .Config}}",
+            image,
+        ],
+        "inspect container image",
+    )
+}
+
 /// The fleet reference of the image a `containers[].image` names: build
 /// the Dockerfile, or pull the reference, then tag the result by its
 /// content. A platform pins the build and the pull to the nodes'
@@ -827,18 +840,29 @@ fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Re
         }
         run_engine(&inspect, "inspect container image")?
     };
-    let content = run_engine(
-        &[
-            "image",
-            "inspect",
-            "--format",
-            "{{json .RootFS.Layers}}{{json .Config}}",
-            &id,
-        ],
-        "inspect container image",
-    )?;
+    let content = image_content(&id)?;
     let reference = crate::container::image_reference(&format!("{:x}", Sha256::digest(&content)));
-    run_engine(&["tag", &id, &reference], "tag container image")?;
+    if let Ok(existing) = image_content(&reference) {
+        if existing != content {
+            bail!("content-addressed container image {reference} has different content");
+        }
+        return Ok(reference);
+    }
+    match run_engine(&["tag", &id, &reference], "tag container image") {
+        Ok(_) => {
+            if image_content(&reference).context("verify tagged container image")? != content {
+                bail!("content-addressed container image {reference} has different content");
+            }
+        }
+        Err(error) => {
+            // Concurrent builds can produce different engine ids for the same
+            // content. A competing tag may already have installed it even when
+            // Docker's delete/recreate of that reference reports AlreadyExists.
+            if !image_content(&reference).is_ok_and(|existing| existing == content) {
+                return Err(error);
+            }
+        }
+    }
     Ok(reference)
 }
 

@@ -35,6 +35,17 @@ It releases two RPC continuations together, then checks that both sequences of
 alarm transactions finish and preserve their committed alarm. Its deadline bounds
 a hung runtime; the fixture uses no sleep to order the calls.
 
+The container-image regression also needs a working Docker engine:
+
+```sh
+node crates/celld/tests/container_images.mjs target/debug/celld
+```
+
+It releases two real fence-image builds together before checking startup. The
+existing `CELLD_DOCKER` boundary also injects failed tags and conflicting content:
+only a freshly verified match may recover. The fixture stops its own celld
+processes and removes temporary project directories; engine images remain cached.
+
 ## Specification: exhaustive at small size
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the
