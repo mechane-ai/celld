@@ -196,6 +196,23 @@ pub struct StartParams {
     pub labels: Vec<(String, String)>,
 }
 
+#[derive(serde::Serialize)]
+pub struct ContainerInfo {
+    pub image: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+pub struct PendingStart {
+    cell: Arc<CellContainer>,
+    run: u64,
+}
+
+impl Drop for PendingStart {
+    fn drop(&mut self) {
+        self.cell.finish_creation(self.run);
+    }
+}
+
 #[derive(Default)]
 struct CellState {
     running: bool,
@@ -231,6 +248,8 @@ pub struct CellContainer {
     /// Written with `send_replace`: a plain `send` discards the value
     /// while nobody subscribes, and `monitor()` usually subscribes late.
     exit: watch::Sender<Option<(u64, Result<i64, String>)>>,
+    /// Last run whose Docker creation finished, successfully or otherwise.
+    created: watch::Sender<u64>,
 }
 
 impl CellContainer {
@@ -277,6 +296,24 @@ impl CellContainer {
         drop(state);
         self.exit.send_replace(None);
         run
+    }
+
+    pub fn begin_start(self: &Arc<Self>) -> PendingStart {
+        PendingStart {
+            cell: self.clone(),
+            run: self.begin_run(),
+        }
+    }
+
+    fn finish_creation(&self, run: u64) {
+        self.created.send_if_modified(|created| {
+            if *created < run {
+                *created = run;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// The run `monitor()` waits on: the newest one.
@@ -797,6 +834,7 @@ impl ContainerEngine {
                     state: Mutex::new(CellState::default()),
                     processes: Mutex::new(Vec::new()),
                     exit: watch::channel(None).0,
+                    created: watch::channel(0).0,
                 })
             });
             // A returning cell cancels the destroy its eviction armed.
@@ -811,6 +849,7 @@ impl ContainerEngine {
         let adopted = running.is_some() && !cell.running();
         if adopted {
             let run = cell.begin_run();
+            cell.finish_creation(run);
             self.watch_exit(&cell, run);
         }
         let mut state = cell.state.lock().unwrap();
@@ -908,19 +947,89 @@ impl ContainerEngine {
         Ok(running.then(|| address_of(&info)))
     }
 
-    /// Start the cell's container. The object's `start()` returns before
-    /// this completes, as on Cloudflare; a failure surfaces through
-    /// `monitor()`.
+    pub async fn inspect(&self, cell: &CellContainer) -> anyhow::Result<Option<ContainerInfo>> {
+        let mut created = cell.created.subscribe();
+        loop {
+            let run = cell.current_run();
+            let finished = *created.borrow_and_update();
+            if finished < run {
+                created
+                    .changed()
+                    .await
+                    .context("container creation ended before inspection")?;
+                continue;
+            }
+            let reply = self
+                .docker
+                .call("GET", &format!("/containers/{}/json", cell.name), None)
+                .await?;
+            if cell.current_run() != run {
+                continue;
+            }
+            if reply.status.as_u16() == 404 {
+                return Ok(None);
+            }
+            if !reply.status.is_success() {
+                return Err(anyhow!(
+                    "inspect container failed with [{}] {}",
+                    reply.status.as_u16(),
+                    reply.message()
+                ));
+            }
+            let info = reply.json()?;
+            let running = info.pointer("/State/Running").and_then(Value::as_bool) == Some(true);
+            let starting = cell.running()
+                && info.pointer("/State/Status").and_then(Value::as_str) == Some("created");
+            if !running && !starting {
+                return Ok(None);
+            }
+            let labels = info
+                .pointer("/Config/Labels")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow!("container inspection answered without labels"))?;
+            for (name, expected) in [
+                ("celld.node", self.node.as_str()),
+                ("celld.cell", cell.scope.as_str()),
+                ("celld.class", cell.spec.class_name.as_str()),
+            ] {
+                if labels.get(name).and_then(Value::as_str) != Some(expected) {
+                    return Err(anyhow!(
+                        "container identity does not match this Durable Object"
+                    ));
+                }
+            }
+            let image = if starting {
+                String::new()
+            } else {
+                info.pointer("/Config/Image")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("container inspection answered without an image"))?
+                    .to_string()
+            };
+            let labels = labels
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some((
+                        name.strip_prefix("celld.user.")?.to_string(),
+                        value.as_str()?.to_string(),
+                    ))
+                })
+                .collect();
+            return Ok(Some(ContainerInfo { image, labels }));
+        }
+    }
+
     /// Start the cell's container for the run `begin_run` opened. The
     /// object's `start()` returns before this completes, as on Cloudflare;
     /// a failure surfaces through `monitor()`.
     pub async fn start(
         &self,
         cell: &Arc<CellContainer>,
-        run: u64,
+        pending: PendingStart,
         params: StartParams,
     ) -> anyhow::Result<()> {
-        let started = self.create_and_start(cell, params).await;
+        let run = pending.run;
+        let started = self.create_and_start(cell, params, pending).await;
         let address = match started {
             Ok(address) => address,
             Err(error) => {
@@ -990,6 +1099,7 @@ impl ContainerEngine {
         &self,
         cell: &CellContainer,
         params: StartParams,
+        pending: PendingStart,
     ) -> anyhow::Result<Address> {
         self.ensure_fence().await?;
         self.enforce_instance_ceiling(cell).await?;
@@ -1139,6 +1249,9 @@ impl ContainerEngine {
                 reply.message()
             ));
         }
+        // Inspect can now read labels from Docker while process startup is
+        // still pending. Dropping a canceled/failed creation also wakes it.
+        drop(pending);
         self.docker
             .expect(
                 "POST",
@@ -1198,6 +1311,9 @@ impl ContainerEngine {
         let mut state = cell.state.lock().unwrap();
         state.running = false;
         state.address = Address::None;
+        let run = state.run;
+        drop(state);
+        cell.finish_creation(run);
         Ok(())
     }
 

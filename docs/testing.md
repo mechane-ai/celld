@@ -46,6 +46,13 @@ existing `CELLD_DOCKER` boundary also injects failed tags and conflicting conten
 only a freshly verified match may recover. The fixture stops its own celld
 processes and removes temporary project directories; engine images remain cached.
 
+`node crates/celld/tests/container_inspect.mjs target/debug/celld` uses the real
+Docker engine through a local socket proxy. It holds process startup after
+creation to check actual starting labels, then checks running image identity,
+absence after destruction or failed startup, and rejection of foreign ownership.
+It never prints container environment values and removes only fixture-created
+containers.
+
 ## Specification: exhaustive at small size
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the

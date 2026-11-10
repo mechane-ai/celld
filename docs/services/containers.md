@@ -28,6 +28,10 @@ celld implements this part of `ctx.container`:
   `enableInternet`, and `labels`.
 - `running` reports the state of the engine, so an object that lost its
   `monitor()` sees the exit at its next event.
+- `inspect()` reads the image and user labels from Docker. It returns `null`
+  when no container is running. During creation it waits for actual Docker
+  metadata; a container whose process is still starting has an empty image
+  string and its startup labels. This does not report application readiness.
 - `monitor()` returns a promise that settles when the container exits.
 - `destroy()` stops the container, and `signal()` sends it a signal.
 - `getTcpPort(port).fetch()` sends an HTTP request to a port, and
@@ -138,7 +142,7 @@ count against `max_instances`. A start over the cap fails, and the node logs
 - celld does not enforce the disk size of an instance type.
 - `max_instances` converges across the fleet instead of holding centrally, so
   the fleet can exceed the cap for one refresh. `celld dev` enforces no cap.
-- `inspect()`, `snapshotDirectory()`, `snapshotContainer()`, and the outbound
+- `snapshotDirectory()`, `snapshotContainer()`, and the outbound
   interception methods reject with an error. `start()` checks `hardTimeout` and
   then ignores it, so a value of 0 or less throws and a valid value has no
   effect.

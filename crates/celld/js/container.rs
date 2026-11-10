@@ -87,16 +87,16 @@ pub(super) fn op_container_start(
     };
     // The run opens here, on the calling thread, so the monitor() that
     // follows this call in the same turn waits for this start's exit.
-    let run = container::engine_if_ready()
+    let pending = container::engine_if_ready()
         .and_then(|engine| engine.cell(&cell))
-        .map(|cell| cell.begin_run());
+        .map(|cell| cell.begin_start());
     let async_id = asyncrt::enqueue_io_context(async move {
         let (engine, cell) = cell_for(&cell).await?;
-        let run = run.unwrap_or_else(|| cell.begin_run());
+        let pending = pending.unwrap_or_else(|| cell.begin_start());
         engine
             .start(
                 &cell,
-                run,
+                pending,
                 StartParams {
                     entrypoint: request.entrypoint,
                     env: request.env,
@@ -107,6 +107,23 @@ pub(super) fn op_container_start(
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok::<String, String>(String::new())
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+pub(super) fn op_container_inspect(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = string_arg(scope, &args, 0);
+    let async_id = asyncrt::enqueue(async move {
+        let (engine, cell) = cell_for(&cell).await?;
+        let info = engine
+            .inspect(&cell)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        serde_json::to_string(&info).map_err(|error| error.to_string())
     });
     rv.set(promise_for(scope, async_id));
 }

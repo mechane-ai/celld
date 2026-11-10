@@ -2557,8 +2557,8 @@ class Container {
     }
     return new ContainerExecProcess(id, pid, stdinMode, stdoutMode, stderrMode);
   }
-  inspect() {
-    return Promise.reject(new Error("inspect() is not implemented in celld"));
+  async inspect() {
+    return JSON.parse(await __container_inspect(this._scope));
   }
   snapshotDirectory() {
     return Promise.reject(new Error("snapshotDirectory() is not implemented in celld"));
