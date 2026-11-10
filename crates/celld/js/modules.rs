@@ -21,6 +21,7 @@ static_source!(NODE_TEST_SOURCE, "node_test.js");
 static_source!(NODE_UTIL_SOURCE, "node_util.js");
 static_source!(NODE_EVENTS_SOURCE, "node_events.js");
 static_source!(NODE_OS_SOURCE, "node_os.js");
+static_source!(NODE_NET_SOURCE, "node_net.js");
 static_source!(NODE_PATH_SOURCE, "node_path.js");
 static_source!(NODE_BUFFER_SOURCE, "node_buffer.js");
 static_source!(NODE_CRYPTO_SOURCE, "node_crypto.js");
@@ -47,6 +48,7 @@ static INTERNAL_MODULE_SOURCES: &[(&str, &v8::OneByteConst)] = &[
     ("node_util.js", &NODE_UTIL_SOURCE),
     ("node_events.js", &NODE_EVENTS_SOURCE),
     ("node_os.js", &NODE_OS_SOURCE),
+    ("node_net.js", &NODE_NET_SOURCE),
     ("node_path.js", &NODE_PATH_SOURCE),
     ("node_buffer.js", &NODE_BUFFER_SOURCE),
     ("node_crypto.js", &NODE_CRYPTO_SOURCE),
@@ -381,6 +383,11 @@ const LAZY_MODULES: &[LazyModule] = &[
         specs: &["events", "node:events"],
         global: "__eventsModule",
         source: &NODE_EVENTS_SOURCE,
+    },
+    LazyModule {
+        specs: &["net", "node:net"],
+        global: "__netModule",
+        source: &NODE_NET_SOURCE,
     },
     LazyModule {
         specs: &["os", "node:os"],

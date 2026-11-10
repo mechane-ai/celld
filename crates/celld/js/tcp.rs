@@ -67,8 +67,8 @@ fn insert(id: u64, stream: Duplex) {
 
 /// Mozilla's roots, the same choice `ws_client` makes and for the same
 /// reason: a downloaded celld must reach TLS hosts on a machine with no
-/// `/etc/ssl/certs`. Test TLS servers use a root injected through the
-/// gated seam below.
+/// `/etc/ssl/certs`. Operators can add private roots with
+/// CELLD_EXTRA_CA_CERTS; internal tests also have the gated seam below.
 #[cfg(celld_internal_tests)]
 fn test_root() -> &'static Mutex<Option<Vec<u8>>> {
     static ROOT: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
@@ -86,33 +86,51 @@ pub fn test_extra_tls_root(der: Vec<u8>) {
 // Rebuilt per handshake only under the internal-tests cfg, where the
 // injected root must be visible; production caches the connector.
 #[cfg(celld_internal_tests)]
-fn tls_connector() -> tokio_rustls::TlsConnector {
+fn tls_connector() -> Result<tokio_rustls::TlsConnector, String> {
     build_tls_connector(test_root().lock().unwrap().clone())
 }
 
 #[cfg(not(celld_internal_tests))]
-fn tls_connector() -> tokio_rustls::TlsConnector {
-    static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
+fn tls_connector() -> Result<tokio_rustls::TlsConnector, String> {
+    static CONNECTOR: OnceLock<Result<tokio_rustls::TlsConnector, String>> = OnceLock::new();
     CONNECTOR.get_or_init(|| build_tls_connector(None)).clone()
 }
 
-fn build_tls_connector(extra_root: Option<Vec<u8>>) -> tokio_rustls::TlsConnector {
+fn build_tls_connector(extra_root: Option<Vec<u8>>) -> Result<tokio_rustls::TlsConnector, String> {
     let mut roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
     if let Some(der) = extra_root {
-        let _ = roots.add(rustls::pki_types::CertificateDer::from(der));
+        roots
+            .add(rustls::pki_types::CertificateDer::from(der))
+            .map_err(|error| format!("invalid extra TLS root: {error}"))?;
+    }
+    if let Some(path) = std::env::var_os("CELLD_EXTRA_CA_CERTS") {
+        use rustls::pki_types::pem::PemObject;
+
+        let certificates = rustls::pki_types::CertificateDer::pem_file_iter(&path)
+            .map_err(|error| format!("CELLD_EXTRA_CA_CERTS: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("CELLD_EXTRA_CA_CERTS: {error}"))?;
+        if certificates.is_empty() {
+            return Err("CELLD_EXTRA_CA_CERTS contains no certificates".into());
+        }
+        for certificate in certificates {
+            roots
+                .add(certificate)
+                .map_err(|error| format!("CELLD_EXTRA_CA_CERTS: {error}"))?;
+        }
     }
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    tokio_rustls::TlsConnector::from(Arc::new(config))
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
 }
 
 async fn handshake(stream: Duplex, host: String) -> Result<Duplex, String> {
     let name = rustls::pki_types::ServerName::try_from(host)
         .map_err(|error| format!("invalid TLS server name: {error}"))?;
-    let tls = tls_connector()
+    let tls = tls_connector()?
         .connect(name, stream)
         .await
         .map_err(|error| format!("TLS handshake failed: {error}"))?;

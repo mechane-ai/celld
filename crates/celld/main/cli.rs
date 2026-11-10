@@ -336,6 +336,7 @@ ENVIRONMENT:
   CELLD_NODE                      Node-session ID (default: generated)
   CELLD_WATCH                     Local SQLite/replication working directory
   CELLD_ESBUILD                   Override esbuild executable path
+  CELLD_EXTRA_CA_CERTS            PEM roots to add for outbound TCP TLS
   CELLD_ACTIVATIONS               Concurrent cold activations
   CELLD_ASSET_CACHE_DIR           Downloaded static-asset cache directory
   CELLD_ASSET_CACHE_BYTES         Asset cache limit

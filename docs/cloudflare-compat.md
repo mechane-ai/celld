@@ -146,6 +146,8 @@ execution.
 - celld implements `node:assert`, `node:async_hooks`, `node:buffer`,
   `node:diagnostics_channel`, `node:events`, `node:fs`, `node:os`, `node:path`,
   `node:stream`, `node:timers/promises`, and `node:util`.
+- `node:net` implements `isIP`, `isIPv4`, and `isIPv6`. Other networking
+  operations remain unsupported; use `cloudflare:sockets`.
 - `node:diagnostics_channel` does not export messages to a tail Worker.
 - `node:crypto` does not implement Diffie-Hellman, streaming signatures,
   ciphers, RSA-PSS, or DSA signatures and key generation.
@@ -176,6 +178,11 @@ celld provides an always-miss cache because it has no shared edge cache.
 - A socket cannot outlive its event. A Durable Object must reconnect during a
   later event.
 - celld verifies a TLS server against its bundled Mozilla root store.
+  `CELLD_EXTRA_CA_CERTS` adds certificates from a PEM file to that store for
+  outbound TCP TLS, including `startTls()`. Set it on the celld process, not
+  as a Worker binding. An unreadable, empty, or invalid file fails the TLS
+  connection. Certificate chains and server names are still verified. The
+  connector reads the file at its first handshake; restart celld after a change.
 - celld does not block the destination ports that Cloudflare blocks. The fleet
   network controls the egress policy.
 
