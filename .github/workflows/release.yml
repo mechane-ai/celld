@@ -123,6 +123,14 @@ jobs:
             node crates/celld/tests/container_host_services.mjs target/release/celld \
             2>&1 | tee out/container-host-services.log
 
+      - name: Check shared container capabilities on candidate bytes
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          npm exec --yes --package=esbuild@0.25.12 -- \
+            node crates/celld/tests/shared_container.mjs target/release/celld \
+            2>&1 | tee out/shared-container.log
+
       - name: Package exact bytes and input manifest
         env:
           CELLD_TARGET: ${{ matrix.target }}
@@ -178,6 +186,7 @@ jobs:
           if target.endswith('-linux-gnu'):
               manifest['runtimeCheckTools']['docker'] = command('docker', 'version', '--format', '{{.Server.Version}}')
               manifest['checks'].append({'name': 'Docker image and live container identities on candidate bytes', 'outcome': 'passed', 'evidence': 'container-images.log', 'evidenceSHA256': digest('out/container-images.log')})
+              manifest['checks'].append({'name': 'shared container files, execution, intercept and RPC on candidate bytes', 'outcome': 'passed', 'evidence': 'shared-container.log', 'evidenceSHA256': digest('out/shared-container.log')})
               manifest['checks'].append({'name': 'operator-scoped host-service grants and cleanup on candidate bytes', 'outcome': 'passed', 'evidence': 'container-host-services.log', 'evidenceSHA256': digest('out/container-host-services.log')})
           elif target.endswith('-apple-darwin'):
               manifest['externalQualification'] = {

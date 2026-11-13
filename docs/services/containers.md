@@ -207,3 +207,28 @@ count against `max_instances`. A start over the cap fails, and the node logs
 
 The [Cloudflare compatibility](../cloudflare-compat.md#services) page lists
 the runtime APIs and the unsupported services.
+
+## Local persistent directories
+
+The Mechane distribution supports `containers[].local_persistent_directories` in
+local `celld dev`. Each absolute, non-overlapping path becomes a Docker volume
+identified by the canonical runtime state directory, Durable Object scope, and
+mount path. Keep the state directory stable when upgrading the runtime. Container
+replacement and runtime shutdown preserve these volumes. They remain on one
+Docker engine; they are not remote backups. Distributed deployment rejects this
+local-only option. Initialize ownership at the image's mount point before first
+use. Never remove another installation's labeled volume during cleanup.
+
+## Local HTTP interception
+
+Register one exact lowercase hostname with native
+`container.interceptOutboundHttp(host, ctx.exports.Entry({ props }))`. The runtime
+creates a private proxy for that container and supplies the captured entrypoint
+props. Guest headers cannot select another owner. The proxy authenticates its
+runtime connection with a random key held outside the guest; dispatch strips that
+key. Requests and responses stream through the normal Worker dispatcher.
+
+Re-register the intercept before startup and when the owning Durable Object
+resumes. Stopping a container revokes its route and reaps its proxy and private
+network. HTTPS, wildcard hosts, multiple hosts, and distributed interception are
+not implemented. This does not broaden operator-only host-service grants.

@@ -23,11 +23,15 @@
 //! into its engine the first time a cell of that class starts, so a node
 //! never talks to a registry.
 
+#[path = "container_egress.rs"]
+pub(crate) mod egress;
+
 use crate::asyncrt;
 use crate::docker::{frame_header, Docker, Stream};
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -56,6 +60,10 @@ pub struct ContainerSpec {
     /// Cloudflare config here, which has no per-class runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Docker volumes for local development only. They remain on this
+    /// engine after container destruction and do not move between nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_persistent_directories: Vec<String>,
 }
 
 /// The reference every engine holds an image under, from its content key.
@@ -141,11 +149,13 @@ const FENCE_RULES: &str = r#"add table inet celld
 add chain inet celld host_services
 add chain inet celld input { type filter hook input priority -10; policy accept; }
 flush chain inet celld input
+add rule inet celld input iifname "ceg*" reject
 add rule inet celld input iifname { "celld0", "celld1" } ct state established,related accept
 add rule inet celld input jump host_services
 add rule inet celld input iifname { "celld0", "celld1" } reject
 add chain inet celld forward { type filter hook forward priority -10; policy accept; }
 flush chain inet celld forward
+add rule inet celld forward iifname "ceg*" oifname != "ceg*" reject
 add rule inet celld forward iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
 add rule inet celld forward iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject
 "#;
@@ -364,6 +374,8 @@ pub struct CellContainer {
     /// Processes `exec()` started in this container. An object drops one
     /// after `output()`; the rest go with the container.
     processes: Mutex<Vec<u64>>,
+    egress: tokio::sync::Mutex<Option<Arc<egress::Binding>>>,
+    started: watch::Sender<Option<(u64, Result<(), String>)>>,
     /// The exit of the current run, `None` while it runs. `Some(Err)` is
     /// an engine failure the wait could not attribute to the process.
     /// Written with `send_replace`: a plain `send` discards the value
@@ -416,6 +428,7 @@ impl CellContainer {
         let run = state.run;
         drop(state);
         self.exit.send_replace(None);
+        self.started.send_replace(None);
         run
     }
 
@@ -457,6 +470,7 @@ pub struct ContainerEngine {
     /// The absolute path of the container resolv.conf this engine wrote and
     /// bind-mounts; `None` when it could not be written.
     resolv_conf: Option<PathBuf>,
+    volume_namespace: String,
     docker: Docker,
     node: String,
     bucket: Option<crate::bucket::Bucket>,
@@ -690,6 +704,7 @@ impl ContainerEngine {
             dns,
             host_service_ports: host_service_ports()?.to_vec(),
             host_service_owner,
+            volume_namespace: data_dir.to_string_lossy().into_owned(),
             data_dir,
             fence_reference: FENCE_IMAGE.read().unwrap().clone(),
             fence_executor: tokio::sync::OnceCell::new(),
@@ -725,6 +740,28 @@ impl ContainerEngine {
         Ok(())
     }
 
+    /// Concurrent shutdown can already be removing the same owned container.
+    /// Confirm absence without repeating the mutation or widening ownership.
+    async fn wait_removed(&self, id: &str) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self
+                .docker
+                .call("GET", &format!("/containers/{id}/json"), None)
+                .await?;
+            if reply.status.as_u16() == 404 {
+                return Ok(());
+            }
+            if !reply.status.is_success() || std::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "container removal remains unconfirmed: {}",
+                    reply.message()
+                ));
+            }
+            asyncrt::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn reap_label(&self, label: &str) -> anyhow::Result<()> {
         let filters = json!({ "label": [label] }).to_string();
         let reply = self
@@ -755,6 +792,11 @@ impl ContainerEngine {
                     .await;
                 match removed {
                     Ok(reply) if reply.status.is_success() || reply.status.as_u16() == 404 => {}
+                    Ok(reply) if reply.status.as_u16() == 409 => {
+                        if let Err(error) = self.wait_removed(id).await {
+                            failures.push(format!("remove owned container {id}: {error:#}"));
+                        }
+                    }
                     Ok(reply) => {
                         failures.push(format!("remove owned container {id}: {}", reply.message()))
                     }
@@ -764,6 +806,33 @@ impl ContainerEngine {
         }
         if !failures.is_empty() {
             return Err(anyhow!("{}", failures.join("; ")));
+        }
+        let reply = self
+            .docker
+            .expect(
+                "GET",
+                &format!(
+                    "/networks?filters={}",
+                    percent_encoding::utf8_percent_encode(
+                        &filters,
+                        percent_encoding::NON_ALPHANUMERIC
+                    )
+                ),
+                None,
+                "list owned container networks",
+            )
+            .await?
+            .json()?;
+        for network in reply.as_array().into_iter().flatten() {
+            let id = network["Id"].as_str().context("owned network id")?;
+            self.docker
+                .expect(
+                    "DELETE",
+                    &format!("/networks/{id}"),
+                    None,
+                    "remove stale HTTP intercept network",
+                )
+                .await?;
         }
         Ok(())
     }
@@ -1239,6 +1308,8 @@ impl ContainerEngine {
                     spec,
                     state: Mutex::new(CellState::default()),
                     processes: Mutex::new(Vec::new()),
+                    egress: tokio::sync::Mutex::new(None),
+                    started: watch::channel(None).0,
                     exit: watch::channel(None).0,
                     created: watch::channel(0).0,
                 })
@@ -1262,6 +1333,10 @@ impl ContainerEngine {
         state.running = running.is_some();
         state.address = running.unwrap_or_default();
         drop(state);
+        if adopted {
+            cell.started
+                .send_replace(Some((cell.current_run(), Ok(()))));
+        }
         Ok(cell)
     }
 
@@ -1449,11 +1524,15 @@ impl ContainerEngine {
                     error = %format!("{error:#}"),
                     "the container did not start"
                 );
-                let mut state = cell.state.lock().unwrap();
-                state.running = false;
-                drop(state);
+                {
+                    let mut state = cell.state.lock().unwrap();
+                    state.running = false;
+                }
                 cell.exit
                     .send_replace(Some((run, Err(format!("{error:#}")))));
+                cell.started
+                    .send_replace(Some((run, Err(format!("{error:#}")))));
+                egress::stop(&self.docker, cell, cell.current_run()).await?;
                 return Err(error);
             }
         };
@@ -1463,6 +1542,7 @@ impl ContainerEngine {
             state.address = address;
         }
         self.watch_exit(cell, run);
+        cell.started.send_replace(Some((run, Ok(()))));
         Ok(())
     }
 
@@ -1490,12 +1570,20 @@ impl ContainerEngine {
                         .ok_or_else(|| anyhow!("wait answered without a status code"))
                 })
                 .map_err(|error| format!("{error:#}"));
-            let mut state = cell_.state.lock().unwrap();
-            if state.run == run {
-                state.running = false;
-                state.address = Address::None;
+            let ended_current = {
+                let mut state = cell_.state.lock().unwrap();
+                let ended_current = state.run == run;
+                if ended_current {
+                    state.running = false;
+                    state.address = Address::None;
+                }
+                ended_current
+            };
+            if ended_current {
+                if let Err(error) = egress::stop(&docker, &cell_, run).await {
+                    tracing::error!(%error, "remove stopped HTTP intercept");
+                }
             }
-            drop(state);
             cell_.exit.send_replace(Some((run, result)));
         })
         .detach();
@@ -1586,6 +1674,37 @@ impl ContainerEngine {
             host_config["ExtraHosts"] =
                 json!([format!("host.docker.internal:{}", gateway.address)]);
         }
+        let mut mounts = Vec::new();
+        for destination in &cell.spec.local_persistent_directories {
+            let identity = json!([self.volume_namespace, cell.scope, destination]);
+            let digest = Sha256::digest(identity.to_string().as_bytes());
+            let name = format!("celld-local-{digest:x}");
+            self.docker
+                .expect(
+                    "POST",
+                    "/volumes/create",
+                    Some(json!({
+                        "Name": name,
+                        "Labels": {
+                            "celld.node": self.node,
+                            "celld.cell": cell.scope,
+                            "celld.class": cell.spec.class_name,
+                            "celld.local-directory": destination,
+                            "celld.local-installation": self.volume_namespace,
+                        },
+                    })),
+                    "create local persistent volume",
+                )
+                .await?;
+            mounts.push(json!({
+                "Type": "volume",
+                "Source": name,
+                "Target": destination,
+            }));
+        }
+        if !mounts.is_empty() {
+            host_config["Mounts"] = json!(mounts);
+        }
         // A class can name its own runtime, else the node default. A class
         // that needs isolation names `runsc`, and the node's daemon must
         // have it or the start fails, so the class runs only where its
@@ -1630,6 +1749,13 @@ impl ContainerEngine {
             "Labels": labels,
             "HostConfig": host_config,
         });
+        if let Some(binding) = cell.egress.lock().await.as_ref() {
+            binding.run.store(cell.current_run(), Ordering::Release);
+            let main_network = if offline { &internal } else { &open };
+            body["NetworkingConfig"] = json!({"EndpointsConfig": {
+                main_network: {}, binding.network.as_str(): {},
+            }});
+        }
         if let Some(entrypoint) = params.entrypoint {
             body["Cmd"] = json!(entrypoint);
         }
@@ -1717,6 +1843,7 @@ impl ContainerEngine {
     }
 
     pub async fn destroy(&self, cell: &Arc<CellContainer>) -> anyhow::Result<()> {
+        egress::stop(&self.docker, cell, cell.current_run()).await?;
         // Kill first so the wait task reports 137 before the removal makes
         // the name disappear under it.
         let _ = self
@@ -1806,6 +1933,23 @@ impl ContainerEngine {
     ) -> anyhow::Result<Arc<ExecProcess>> {
         if !cell.running() {
             return Err(anyhow!("exec() requires a running container."));
+        }
+        // start() returns before Docker creates the container. Queue the
+        // first exec behind that exact run without retrying the command.
+        let run = cell.current_run();
+        let mut started = cell.started.subscribe();
+        loop {
+            if let Some((started_run, result)) = started.borrow_and_update().clone() {
+                if started_run != run {
+                    return Err(anyhow!("the container restarted before exec()"));
+                }
+                result.map_err(anyhow::Error::msg)?;
+                break;
+            }
+            started
+                .changed()
+                .await
+                .context("the container engine went away")?;
         }
         let mut body = json!({
             "AttachStdin": true,

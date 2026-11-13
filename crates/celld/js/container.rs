@@ -340,3 +340,28 @@ pub(super) fn op_container_exec_drop(
     let id = number_arg(scope, &args, 0);
     container::drop_process(id);
 }
+
+pub(super) fn op_container_intercept_http(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = string_arg(scope, &args, 0);
+    let host = string_arg(scope, &args, 1);
+    let name = string_arg(scope, &args, 2);
+    let props = view_bytes(args.get(3)).unwrap_or_default();
+    let route = container::egress::Route {
+        generation: current_generation(scope),
+        script: actor_runtime_state(scope).script_name.clone(),
+        entrypoint: crate::WorkerFetchEntrypoint { name, props },
+    };
+    let async_id = asyncrt::enqueue(async move {
+        let (engine, cell) = cell_for(&cell).await?;
+        engine
+            .intercept_http(&cell, host, route)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok::<String, String>(String::new())
+    });
+    rv.set(promise_for(scope, async_id));
+}

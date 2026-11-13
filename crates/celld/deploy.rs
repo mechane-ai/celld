@@ -405,6 +405,8 @@ struct ContainerDecl {
     max_instances: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    local_persistent_directories: Vec<String>,
 }
 
 struct ProjectAssets {
@@ -586,6 +588,14 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let mut project = read_project(&config_path, &root, &options.vars)?;
+    if !options.local_images
+        && project
+            .containers
+            .iter()
+            .any(|container| !container.local_persistent_directories.is_empty())
+    {
+        bail!("containers[].local_persistent_directories is supported only by celld dev; Docker volumes do not follow cells between nodes");
+    }
     // Resolve every image before the version is computed: the id is part of
     // the deployment's identity, so a rebuilt image is a new deployment.
     // A fleet deploy builds for the platform the nodes run, which Wrangler
@@ -609,6 +619,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             instance_type: decl.instance_type.clone(),
             max_instances: decl.max_instances,
             runtime: decl.runtime.clone(),
+            local_persistent_directories: decl.local_persistent_directories.clone(),
         })
         .collect();
     if !container_specs.is_empty() {
@@ -2203,7 +2214,13 @@ fn read_containers(
         if let Some(key) = entry.keys().find(|key| {
             !matches!(
                 key.as_str(),
-                "class_name" | "image" | "name" | "instance_type" | "max_instances" | "runtime"
+                "class_name"
+                    | "image"
+                    | "name"
+                    | "instance_type"
+                    | "max_instances"
+                    | "runtime"
+                    | "local_persistent_directories"
             )
         }) {
             bail!("config `containers[{index}]` declares `{key}`, which celld does not model");
@@ -2281,6 +2298,32 @@ fn read_containers(
                     })
             })
             .transpose()?;
+        let local_persistent_directories = entry
+            .get("local_persistent_directories")
+            .map(|value| {
+                let directories: Vec<String> = serde_json::from_value(value.clone())
+                    .context("containers[].local_persistent_directories must be an array of paths")?;
+                for (index, directory) in directories.iter().enumerate() {
+                    let path = Path::new(directory);
+                    let normalized = path.components().collect::<PathBuf>();
+                    if !path.is_absolute()
+                        || directory == "/"
+                        || normalized.as_os_str() != directory.as_str()
+                        || directory.contains('\0')
+                        || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+                    {
+                        bail!("local_persistent_directories must contain normalized absolute directory paths other than /: {directory:?}");
+                    }
+                    if directories[..index].iter().any(|other| {
+                        path.starts_with(other) || Path::new(other).starts_with(path)
+                    }) {
+                        bail!("local_persistent_directories cannot duplicate or overlap: {directory:?}");
+                    }
+                }
+                Ok::<_, anyhow::Error>(directories)
+            })
+            .transpose()?
+            .unwrap_or_default();
         declared.push(ContainerDecl {
             class_name: class_name.to_string(),
             image: image.to_string(),
@@ -2288,6 +2331,7 @@ fn read_containers(
             instance_type,
             max_instances,
             runtime,
+            local_persistent_directories,
         });
     }
     Ok(declared)
