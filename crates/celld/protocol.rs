@@ -74,6 +74,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_WASM_V1,
     FEATURE_WORKFLOWS_V1,
     FEATURE_PYTHON_WORKERS_V1,
+    FEATURE_ES_MODULES_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -97,6 +98,8 @@ pub const FEATURE_CRON_V1: &str = "cron-v1";
 pub const FEATURE_R2_V1: &str = "r2-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
+/// Ordinary deployments with exact, separately named JavaScript modules.
+pub const FEATURE_ES_MODULES_V1: &str = "es-modules-v1";
 /// A deployment whose `main` is a `.py` file. Required because the bundle
 /// passes the Workers SDK's own body streams back to `Response`, and a node
 /// whose body streams do not report `ReadableStream` as their constructor
@@ -333,9 +336,9 @@ pub struct ModuleRef {
     /// The loader also accepts the 16-character prefix written by celld and
     /// the managed control plane before full module digests were introduced.
     pub sha256: String,
-    /// Absent means UTF-8 source: the main module is ESM, siblings become
-    /// text modules. `wasm` bytes become a module whose default export is a
-    /// compiled `WebAssembly.Module` (Wrangler's `CompiledWasm` rule).
+    /// Absent means legacy UTF-8 source: the main module is ESM, siblings
+    /// become text modules. `esmodule` preserves a JavaScript sibling;
+    /// `wasm` exports a compiled `WebAssembly.Module`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<ModuleKind>,
 }
@@ -374,6 +377,62 @@ impl ModuleRef {
 #[serde(rename_all = "lowercase")]
 pub enum ModuleKind {
     Wasm,
+    EsModule,
+}
+
+/// A module name is a relative path in one deployment's module registry.
+pub(crate) fn validate_module_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && !name.contains('\\')
+            && !name.chars().any(char::is_control)
+            && !["node:", "cloudflare:", "celld:"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            && name.split('/').all(|part| !matches!(part, "" | "." | "..")),
+        "invalid deployment module name {name:?}"
+    );
+    Ok(())
+}
+
+/// Typed inventories must be unambiguous before any module is fetched or compiled.
+pub(crate) fn validate_module_manifest(manifest: &Manifest) -> anyhow::Result<()> {
+    let enabled = manifest
+        .required_features
+        .iter()
+        .any(|feature| feature == FEATURE_ES_MODULES_V1);
+    anyhow::ensure!(
+        enabled
+            || manifest
+                .modules
+                .iter()
+                .all(|module| module.kind != Some(ModuleKind::EsModule)),
+        "ES modules require the {FEATURE_ES_MODULES_V1} deployment feature"
+    );
+    if !enabled {
+        return Ok(());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for module in &manifest.modules {
+        validate_module_name(&module.name)?;
+        anyhow::ensure!(
+            names.insert(&module.name),
+            "duplicate deployment module {:?}",
+            module.name
+        );
+    }
+    let main = manifest
+        .main_module
+        .as_ref()
+        .context("ES module deployment requires a main module")?;
+    anyhow::ensure!(
+        manifest
+            .modules
+            .iter()
+            .any(|module| &module.name == main && module.kind == Some(ModuleKind::EsModule)),
+        "deployment main module {main:?} is absent or is not an ES module"
+    );
+    Ok(())
 }
 
 /// Reference from a deploy manifest to its immutable, canonical asset index.

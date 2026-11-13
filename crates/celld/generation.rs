@@ -465,6 +465,7 @@ impl Generation {
         graph: DeploymentGraph,
         options: GenerationOptions,
     ) -> anyhow::Result<Self> {
+        crate::container::host_service_ports()?;
         let GenerationOptions { node, region } = options;
         let DeploymentGraph { primary, cohosted } = graph;
         crate::runtime::init_engine();
@@ -551,6 +552,7 @@ impl Generation {
             let is_primary = index == 0;
             let crate::fleet::LoadedDeployment {
                 options,
+                main_module_name,
                 script_name: script,
                 asset_binding,
                 loader_bindings,
@@ -567,8 +569,12 @@ impl Generation {
                 assets.insert(script.clone(), resolver);
             }
             let classes = options.do_classes.clone();
+            let mut config = WorkerConfig::new(options);
+            if let Some(name) = main_module_name {
+                config = config.with_main_module_name(name);
+            }
             let config = Arc::new(
-                WorkerConfig::new(options)
+                config
                     .with_services(services)
                     .with_asset_binding(asset_binding)
                     .with_loaders(loader_bindings)

@@ -2102,7 +2102,7 @@ impl WorkerConfig {
         self
     }
 
-    fn with_main_module_name(mut self, name: String) -> Self {
+    pub(crate) fn with_main_module_name(mut self, name: String) -> Self {
         self.main_module_name = name;
         self
     }
@@ -3577,7 +3577,12 @@ impl InFlight {
 
     /// Done when the response is sent and no referenced work remains.
     pub fn finished(&self) -> bool {
-        self.retired() && !self.has_refed_ops()
+        // Native operations can outlive the reply and start a critical
+        // section during another event's turn. Keep their origin available.
+        self.retired()
+            && !self.has_refed_ops()
+            && !self.context.has_handed_ops()
+            && self.context.retire_without_cross_entry_gate()
     }
 
     /// Whether an operation can keep this event alive.
@@ -3681,7 +3686,7 @@ impl InFlight {
             // A reaction from this event can run its block during another
             // event's turn. Retain this event until that block releases its
             // claim, or retirement closes resources the callback still uses.
-            && self.context.retire_without_cross_entry_gate()
+            && !self.context.has_cross_entry_gate_claim()
     }
 
     fn has_cell_handler_ops(&self) -> bool {
@@ -6753,6 +6758,7 @@ ops! { OP_NAMES, install_op_functions,
         "__tcp_shutdown" => tcp::op_tcp_shutdown,
         "__tcp_close" => tcp::op_tcp_close,
         "__tcp_starttls" => tcp::op_tcp_starttls,
+        "__container_intercept_http" => container::op_container_intercept_http,
         "__container_running" => container::op_container_running,
         "__container_address" => container::op_container_address,
         "__container_start" => container::op_container_start,
@@ -10773,7 +10779,7 @@ impl BundleTree {
         let mut nodes = HashMap::new();
         nodes.insert("/bundle".to_string(), BundleNode::Directory);
         let entry = std::iter::once((
-            ENTRY_MODULE_NAME,
+            config.main_module_name.as_str(),
             bytes::Bytes::copy_from_slice(config.src.as_bytes()),
         ));
         let modules = config.modules.iter().map(|(name, source)| {

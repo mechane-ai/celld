@@ -43,11 +43,42 @@ dedicated build output directory. It skips `.git`, `.celld`, `.wrangler`, and
 symbolic links to directories. It refuses a symbolic link whose name matches a
 WASM pattern, so copy the file into the build output instead.
 
-celld does not implement the other
-[Wrangler module discovery settings](https://developers.cloudflare.com/workers/wrangler/configuration/#find-additional-modules).
-It does not discover additional JavaScript modules and does not accept
-`rules`, `base_dir`, or `find_additional_modules`. The JavaScript must already
-be bundled, and its WASM imports must be relative to the entry directory.
+To deploy a prebuilt JavaScript module graph without processing it again, opt
+into [Wrangler's additional module settings](https://developers.cloudflare.com/workers/wrangler/bundling/#find-additional-modules):
+
+```jsonc
+{
+  "name": "prebuilt-app",
+  "main": "./entry.mjs",
+  "no_bundle": true,
+  "find_additional_modules": true,
+  "base_dir": ".",
+  "rules": [
+    { "type": "ESModule", "globs": ["candidate/**/*.js"] },
+    { "type": "CompiledWasm", "globs": ["candidate/**/*.wasm"] }
+  ]
+}
+```
+
+The entry can import `./candidate/worker.js`, including its named Durable
+Object exports. Every selected file reaches the same ordinary Worker module
+registry with its original bytes and its path relative to `base_dir`.
+Module types participate in deployment identity. A node without `es-modules-v1`
+refuses this deployment.
+
+`base_dir` defaults to the entry's directory. It must remain inside the project,
+and the entry must be inside it. celld does not follow directory symlinks and
+refuses selected symlinks, unsafe names, conflicting module types, invalid UTF-8
+JavaScript, and unsupported rule types. A rule's `fallthrough: true` permits
+another rule of that type; otherwise a later rule of that type is refused.
+The default Wasm patterns apply unless a `CompiledWasm` rule replaces them.
+
+For compatibility with existing celld prebuilt deployments, JavaScript discovery
+requires explicit `find_additional_modules: true`, rather than Wrangler's
+implicit default for `no_bundle`. Only `ESModule` and `CompiledWasm` discovery
+are currently supported, and this mode requires `no_bundle: true`; it does not
+partially bundle or transform selected files. Without the opt-in, the existing
+entry-and-Wasm behavior above is unchanged.
 
 ## Rust with workers-rs
 

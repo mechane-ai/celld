@@ -2566,8 +2566,14 @@ class Container {
   snapshotContainer() {
     return Promise.reject(new Error("snapshotContainer() is not implemented in celld"));
   }
-  interceptOutboundHttp() {
-    return Promise.reject(new Error("interceptOutboundHttp() is not implemented in celld"));
+  async interceptOutboundHttp(host, handler) {
+    if (typeof host !== "string" || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(host))
+      throw new TypeError("interceptOutboundHttp() requires one exact lowercase hostname");
+    const route = __svcMeta.get(handler);
+    if (route === undefined)
+      throw new TypeError("interceptOutboundHttp() requires a ctx.exports WorkerEntrypoint");
+    const props = route.props === undefined ? new Uint8Array() : __rpcOut(route.props, false);
+    await __container_intercept_http(this._scope, host, route.name, props);
   }
   interceptOutboundHttps() {
     return Promise.reject(new Error("interceptOutboundHttps() is not implemented in celld"));
@@ -5044,29 +5050,34 @@ const __rpcDesArgs = (bytes) => {
   const revived = __stubRevive(__sc_decode(bytes.subarray(1)));
   return { args: revived.value, received: revived.handles };
 };
+// Workerd gives every object RPC result a disposer, even without capability handles.
+const __rpcWithDisposer = (value, handles, disposers) => {
+  if (value !== null && typeof value === "object" && !__stubMeta.has(value)) {
+    Object.defineProperty(value, Symbol.dispose, {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: () => {
+        for (const handle of handles) __disposeStub(handle);
+        for (const entry of disposers) {
+          __stubEntries.delete(entry.id);
+          Promise.resolve().then(() => entry.target());
+        }
+      },
+    });
+  }
+  return value;
+};
 // The caller half: decode a reply, rebuilding stubs and rethrowing
 // callee exceptions as real Errors with the callee's own
 // properties, `.remote`, and a local (caller-side) stack.
 const __rpcDes = (bytes) => {
-  if (bytes[0] === 0xff) return __sc_decode(bytes);
+  if (bytes[0] === 0xff)
+    return __rpcWithDisposer(__sc_decode(bytes), [], []);
   if (bytes[0] === 1 || bytes[0] === 2) {
     const { value, handles, disposers } =
       __stubRevive(__sc_decode(bytes.subarray(1)));
-    if (value !== null && typeof value === "object" &&
-        !__stubMeta.has(value) &&
-        (handles.length > 0 || disposers.length > 0)) {
-      Object.defineProperty(value, Symbol.dispose, {
-        configurable: true,
-        value: () => {
-          for (const handle of handles) __disposeStub(handle);
-          for (const entry of disposers) {
-            __stubEntries.delete(entry.id);
-            Promise.resolve().then(() => entry.target());
-          }
-        },
-      });
-    }
-    return value;
+    return __rpcWithDisposer(value, handles, disposers);
   }
   const [error, props] = __sc_decode(bytes.subarray(1));
   if (error instanceof Error) {

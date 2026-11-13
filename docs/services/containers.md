@@ -106,6 +106,51 @@ cannot reach the built-in resolver of the engine. The fence permits the public
 resolver. A container on the default runtime keeps the engine resolver unless
 the operator sets `CELLD_CONTAINER_DNS`.
 
+### Local host services
+
+`CELLD_CONTAINER_HOST_SERVICES=8443,9443` lets an operator grant TCP access to
+explicit local service ports on Linux. Unset or empty grants nothing. Each
+entry must be a decimal port from 1 through 65535; names, URLs, ranges and
+wildcards are refused. celld captures the setting before loading Worker code.
+`Container.start()` options, Worker `process.env`, and container environment
+variables cannot add a grant.
+
+An opted-in Linux container resolves `host.docker.internal` to its own
+bridge's IPv4 gateway. Only that bridge interface, gateway address and declared
+TCP port are admitted. Other host ports, private forwarding, metadata access,
+and container-to-container traffic remain fenced. The service must listen on
+an address reachable from the bridge; a loopback-only listener is not enough.
+Keep TLS verification and service authentication at the service boundary.
+This is an operator grant to guests on the shared celld bridges, not a
+per-application authentication policy.
+
+Each node owns its grant under its canonical state-directory path. Allocate and
+keep the service port owned before starting celld. Managed shutdown removes
+that node's grant after stopping its containers, without removing another
+node's grants or unrelated nftables tables. A restart using the same state
+directory replaces its prior grant, including when the setting is now empty.
+An explicit declaration, including `CELLD_CONTAINER_HOST_SERVICES=`, waits
+for orphan cleanup and grant reconciliation before announcing readiness.
+Managed cleanup failure exits nonzero; `celld dev` forwards that failure.
+Before granting access, celld atomically saves an owner-only cleanup receipt
+with the fence image's immutable Docker identity. This executor survives a
+generation that removes every container class. A retained receipt also forces
+cleanup before readiness when the next declaration is unset or empty. The
+receipt is retired after successful owned cleanup; a fresh container-free
+state without a receipt does not connect to Docker.
+Do not run two live nodes with the same state directory or mix older celld
+versions on the same Docker engine: older versions replace the shared fence.
+
+A forced kill or failed Docker cleanup does not prove revocation. Keep the
+gateway and its port owned until the same node has restarted, reconciled its
+grant and completed managed shutdown. Only then close the gateway and reuse
+the port. Do not delete or rename that state directory before reconciliation.
+
+On macOS celld preserves Docker Desktop's existing `host.docker.internal`
+forwarding and does not replace it with the Linux VM's bridge address. This
+setting adds no VM-host grant there and does not restrict Docker Desktop's
+own host forwarding. It is not evidence of Linux network isolation on macOS.
+
 ## Sleep, wake, and the node's resources
 
 `setInactivityTimeout()` sets the idle window, and the default is 10 minutes, as
@@ -162,3 +207,28 @@ count against `max_instances`. A start over the cap fails, and the node logs
 
 The [Cloudflare compatibility](../cloudflare-compat.md#services) page lists
 the runtime APIs and the unsupported services.
+
+## Local persistent directories
+
+The Mechane distribution supports `containers[].local_persistent_directories` in
+local `celld dev`. Each absolute, non-overlapping path becomes a Docker volume
+identified by the canonical runtime state directory, Durable Object scope, and
+mount path. Keep the state directory stable when upgrading the runtime. Container
+replacement and runtime shutdown preserve these volumes. They remain on one
+Docker engine; they are not remote backups. Distributed deployment rejects this
+local-only option. Initialize ownership at the image's mount point before first
+use. Never remove another installation's labeled volume during cleanup.
+
+## Local HTTP interception
+
+Register one exact lowercase hostname with native
+`container.interceptOutboundHttp(host, ctx.exports.Entry({ props }))`. The runtime
+creates a private proxy for that container and supplies the captured entrypoint
+props. Guest headers cannot select another owner. The proxy authenticates its
+runtime connection with a random key held outside the guest; dispatch strips that
+key. Requests and responses stream through the normal Worker dispatcher.
+
+Re-register the intercept before startup and when the owning Durable Object
+resumes. Stopping a container revokes its route and reaps its proxy and private
+network. HTTPS, wildcard hosts, multiple hosts, and distributed interception are
+not implemented. This does not broaden operator-only host-service grants.

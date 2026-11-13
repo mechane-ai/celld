@@ -23,12 +23,17 @@
 //! into its engine the first time a cell of that class starts, so a node
 //! never talks to a registry.
 
+#[path = "container_egress.rs"]
+pub(crate) mod egress;
+
 use crate::asyncrt;
 use crate::docker::{frame_header, Docker, Stream};
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -55,6 +60,10 @@ pub struct ContainerSpec {
     /// Cloudflare config here, which has no per-class runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Docker volumes for local development only. They remain on this
+    /// engine after container destruction and do not move between nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_persistent_directories: Vec<String>,
 }
 
 /// The reference every engine holds an image under, from its content key.
@@ -133,31 +142,153 @@ const PIDS_LIMIT: u64 = 1024;
 const OPEN_BRIDGE: &str = "celld0";
 const INTERNAL_BRIDGE: &str = "celld1";
 const BRIDGE_NAME_OPTION: &str = "com.docker.network.bridge.name";
-/// The fence, installed on the node from a one-shot privileged container of
-/// the `celld-fence` image: a container may reach the Internet and nothing
-/// of the node's own. Hooks before Docker's own chains (priority filter -
-/// 10) so a verdict here is final. Input: no new connection from a bridge
-/// to the node itself, which is where the internal listener and the public
-/// listener bind; replies to connections the node opened still pass.
-/// Forward: nothing to the private ranges, where the fleet, the VPC, and
-/// the metadata service live. Rules on the host side of the bridge cover
-/// every runtime, gVisor included, and no process inside a container can
-/// see them, let alone remove them.
-const FENCE_RULES: &str = r#"table inet celld
-delete table inet celld
-table inet celld {
-  chain input {
-    type filter hook input priority -10; policy accept;
-    iifname { "celld0", "celld1" } ct state established,related accept
-    iifname { "celld0", "celld1" } reject
-  }
-  chain forward {
-    type filter hook forward priority -10; policy accept;
-    iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
-    iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject
-  }
-}
+/// Refresh only the base chains: another node can share the Docker engine
+/// and own grants in `host_services`. An empty grant chain retains the
+/// default denial of new bridge-to-node connections.
+const FENCE_RULES: &str = r#"add table inet celld
+add chain inet celld host_services
+add chain inet celld input { type filter hook input priority -10; policy accept; }
+flush chain inet celld input
+add rule inet celld input iifname "ceg*" reject
+add rule inet celld input iifname { "celld0", "celld1" } ct state established,related accept
+add rule inet celld input jump host_services
+add rule inet celld input iifname { "celld0", "celld1" } reject
+add chain inet celld forward { type filter hook forward priority -10; policy accept; }
+flush chain inet celld forward
+add rule inet celld forward iifname "ceg*" oifname != "ceg*" reject
+add rule inet celld forward iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
+add rule inet celld forward iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject
 "#;
+
+/// Captured before any user isolate loads. Worker process.env and guest
+/// environment values cannot change a native network grant.
+struct HostServiceConfig {
+    ports: Vec<u16>,
+    declared: bool,
+}
+
+fn host_service_config() -> anyhow::Result<&'static HostServiceConfig> {
+    static CONFIG: OnceLock<Result<HostServiceConfig, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let value = match std::env::var("CELLD_CONTAINER_HOST_SERVICES") {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            Ok(HostServiceConfig {
+                ports: parse_host_service_ports(value.as_deref().unwrap_or_default())
+                    .map_err(|error| error.to_string())?,
+                declared: value.is_some(),
+            })
+        })
+        .as_ref()
+        .map_err(|message| anyhow!("CELLD_CONTAINER_HOST_SERVICES: {message}"))
+}
+
+pub(crate) fn host_service_ports() -> anyhow::Result<&'static [u16]> {
+    Ok(host_service_config()?.ports.as_slice())
+}
+
+/// Explicit declarations and retained cleanup receipts reconcile before
+/// readiness. An unset declaration revokes any retained host-service grant.
+pub async fn reconcile_host_services() -> anyhow::Result<()> {
+    let directory = CONFIG
+        .read()
+        .unwrap()
+        .as_ref()
+        .ok_or_else(|| anyhow!("the container engine is not configured on this node"))?
+        .data_dir
+        .clone();
+    let retained = read_fence_executor(&directory)?.is_some();
+    if host_service_config()?.declared || retained {
+        if host_service_ports()?.is_empty()
+            && !retained
+            && ENGINE.get().is_none()
+            && FENCE_IMAGE.read().unwrap().is_none()
+        {
+            return Ok(());
+        }
+        engine().await?;
+    }
+    Ok(())
+}
+
+fn parse_host_service_ports(value: &str) -> anyhow::Result<Vec<u16>> {
+    let mut ports = Vec::new();
+    if value.is_empty() {
+        return Ok(ports);
+    }
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() || !entry.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(anyhow!(
+                "expected comma-separated TCP ports from 1 through 65535"
+            ));
+        }
+        let port = entry
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| anyhow!("expected comma-separated TCP ports from 1 through 65535"))?;
+        ports.push(port);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
+}
+
+struct BridgeGateway {
+    bridge: &'static str,
+    address: Ipv4Addr,
+}
+
+const FENCE_RECEIPT: &str = "container-fence.json";
+const FENCE_RECEIPT_PENDING: &str = "container-fence.json.new";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FenceExecutor {
+    version: u8,
+    reference: String,
+    image: String,
+}
+
+fn immutable_image(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn canonical_state_directory(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let fs = asyncrt::fs();
+    fs.create_dir_all(path)
+        .context("create container state directory")?;
+    fs.canonicalize(path)
+        .context("resolve container state directory identity")
+}
+
+fn read_fence_executor(directory: &std::path::Path) -> anyhow::Result<Option<FenceExecutor>> {
+    let bytes = match asyncrt::fs().read(&directory.join(FENCE_RECEIPT)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read owned fence executor"),
+    };
+    let executor: FenceExecutor =
+        serde_json::from_slice(&bytes).context("decode owned fence executor")?;
+    if executor.version != 1
+        || !immutable_image(&executor.reference, "celld-image:")
+        || !immutable_image(&executor.image, "sha256:")
+    {
+        return Err(anyhow!(
+            "owned fence executor has an invalid immutable image identity"
+        ));
+    }
+    Ok(Some(executor))
+}
 
 /// Docker's bridge option that forbids traffic between two containers on
 /// the same bridge. The node still reaches every container, because it
@@ -243,6 +374,8 @@ pub struct CellContainer {
     /// Processes `exec()` started in this container. An object drops one
     /// after `output()`; the rest go with the container.
     processes: Mutex<Vec<u64>>,
+    egress: tokio::sync::Mutex<Option<Arc<egress::Binding>>>,
+    started: watch::Sender<Option<(u64, Result<(), String>)>>,
     /// The exit of the current run, `None` while it runs. `Some(Err)` is
     /// an engine failure the wait could not attribute to the process.
     /// Written with `send_replace`: a plain `send` discards the value
@@ -295,6 +428,7 @@ impl CellContainer {
         let run = state.run;
         drop(state);
         self.exit.send_replace(None);
+        self.started.send_replace(None);
         run
     }
 
@@ -327,9 +461,16 @@ pub struct ContainerEngine {
     runtime: Option<String>,
     /// See `Config::dns`.
     dns: Vec<String>,
+    host_service_ports: Vec<u16>,
+    host_service_owner: String,
+    data_dir: PathBuf,
+    fence_reference: Option<String>,
+    fence_executor: tokio::sync::OnceCell<FenceExecutor>,
+    bridge_gateways: tokio::sync::OnceCell<Vec<BridgeGateway>>,
     /// The absolute path of the container resolv.conf this engine wrote and
     /// bind-mounts; `None` when it could not be written.
     resolv_conf: Option<PathBuf>,
+    volume_namespace: String,
     docker: Docker,
     node: String,
     bucket: Option<crate::bucket::Bucket>,
@@ -447,17 +588,31 @@ pub fn engine_if_ready() -> Option<Arc<ContainerEngine>> {
 /// none of them, and a handoff cut by the deadline leaves cells behind
 /// too; without this their containers ran on until the next start of the
 /// same node reaped them, invisible to the object that owned them.
-pub async fn shutdown() {
+pub async fn shutdown() -> anyhow::Result<()> {
     let Some(engine) = engine_if_ready() else {
-        return;
+        return Ok(());
     };
+    let mut failures = Vec::new();
     if let Err(error) = engine.reap().await {
-        tracing::warn!(
-            event = "container_shutdown_reap_failed",
-            error = %format!("{error:#}"),
-            "containers of this node may still be running"
-        );
+        failures.push(format!("reap owned containers: {error:#}"));
     }
+    if let Err(error) = engine.revoke_host_services().await {
+        failures.push(format!("revoke owned host-service grants: {error:#}"));
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!("container cleanup failed; keep host-service ports owned until the same state directory reconciles: {}", failures.join("; ")));
+    }
+    for name in [FENCE_RECEIPT, FENCE_RECEIPT_PENDING] {
+        match asyncrt::fs().remove_file(&engine.data_dir.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("retire owned fence executor {name}: {error}")),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!("{}", failures.join("; ")));
+    }
+    Ok(())
 }
 
 /// Connect and load every image of the installed specs, ahead of the
@@ -505,6 +660,7 @@ impl ContainerEngine {
         dns: Vec<String>,
         data_dir: PathBuf,
     ) -> anyhow::Result<Self> {
+        let data_dir = canonical_state_directory(&data_dir)?;
         // Write the resolv.conf once, to bind into every container that runs
         // under a non-default runtime. gVisor cannot reach Docker's embedded
         // resolver, so a bind-mounted file with a public resolver, which the
@@ -535,12 +691,24 @@ impl ContainerEngine {
                 }
             }
         };
+        use sha2::Digest;
+        let host_service_owner = format!(
+            "host_{:x}",
+            sha2::Sha256::digest(data_dir.as_os_str().as_encoded_bytes())
+        );
         let engine = Self {
             docker,
             node,
             bucket,
             runtime,
             dns,
+            host_service_ports: host_service_ports()?.to_vec(),
+            host_service_owner,
+            volume_namespace: data_dir.to_string_lossy().into_owned(),
+            data_dir,
+            fence_reference: FENCE_IMAGE.read().unwrap().clone(),
+            fence_executor: tokio::sync::OnceCell::new(),
+            bridge_gateways: tokio::sync::OnceCell::new(),
             resolv_conf,
             images: Mutex::new(HashMap::new()),
             cells: Mutex::new(HashMap::new()),
@@ -548,6 +716,7 @@ impl ContainerEngine {
             fenced: tokio::sync::Mutex::new(false),
         };
         engine.reap().await?;
+        engine.ensure_fence().await?;
         Ok(engine)
     }
 
@@ -556,7 +725,45 @@ impl ContainerEngine {
     }
 
     async fn reap(&self) -> anyhow::Result<()> {
-        let filters = json!({ "label": [format!("celld.node={}", self.node)] }).to_string();
+        let mut failures = Vec::new();
+        for label in [
+            format!("celld.node={}", self.node),
+            format!("celld.host-service-owner={}", self.host_service_owner),
+        ] {
+            if let Err(error) = self.reap_label(&label).await {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            return Err(anyhow!("{}", failures.join("; ")));
+        }
+        Ok(())
+    }
+
+    /// Concurrent shutdown can already be removing the same owned container.
+    /// Confirm absence without repeating the mutation or widening ownership.
+    async fn wait_removed(&self, id: &str) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self
+                .docker
+                .call("GET", &format!("/containers/{id}/json"), None)
+                .await?;
+            if reply.status.as_u16() == 404 {
+                return Ok(());
+            }
+            if !reply.status.is_success() || std::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "container removal remains unconfirmed: {}",
+                    reply.message()
+                ));
+            }
+            asyncrt::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn reap_label(&self, label: &str) -> anyhow::Result<()> {
+        let filters = json!({ "label": [label] }).to_string();
         let reply = self
             .docker
             .expect(
@@ -573,13 +780,59 @@ impl ContainerEngine {
             )
             .await?;
         let list = reply.json()?;
-        for entry in list.as_array().into_iter().flatten() {
+        let mut failures = Vec::new();
+        for entry in list
+            .as_array()
+            .ok_or_else(|| anyhow!("container list is not an array"))?
+        {
             if let Some(id) = entry.get("Id").and_then(Value::as_str) {
-                let _ = self
+                let removed = self
                     .docker
                     .call("DELETE", &format!("/containers/{id}?force=true"), None)
                     .await;
+                match removed {
+                    Ok(reply) if reply.status.is_success() || reply.status.as_u16() == 404 => {}
+                    Ok(reply) if reply.status.as_u16() == 409 => {
+                        if let Err(error) = self.wait_removed(id).await {
+                            failures.push(format!("remove owned container {id}: {error:#}"));
+                        }
+                    }
+                    Ok(reply) => {
+                        failures.push(format!("remove owned container {id}: {}", reply.message()))
+                    }
+                    Err(error) => failures.push(format!("remove owned container {id}: {error:#}")),
+                }
             }
+        }
+        if !failures.is_empty() {
+            return Err(anyhow!("{}", failures.join("; ")));
+        }
+        let reply = self
+            .docker
+            .expect(
+                "GET",
+                &format!(
+                    "/networks?filters={}",
+                    percent_encoding::utf8_percent_encode(
+                        &filters,
+                        percent_encoding::NON_ALPHANUMERIC
+                    )
+                ),
+                None,
+                "list owned container networks",
+            )
+            .await?
+            .json()?;
+        for network in reply.as_array().into_iter().flatten() {
+            let id = network["Id"].as_str().context("owned network id")?;
+            self.docker
+                .expect(
+                    "DELETE",
+                    &format!("/networks/{id}"),
+                    None,
+                    "remove stale HTTP intercept network",
+                )
+                .await?;
         }
         Ok(())
     }
@@ -720,19 +973,233 @@ impl ContainerEngine {
         if *fenced {
             return Ok(());
         }
-        let image = FENCE_IMAGE.read().unwrap().clone().ok_or_else(|| {
-            anyhow!(
-                "this deployment has no fence image; deploy it again with this celld, which \
-                 saves the celld-fence image beside the container images"
-            )
-        })?;
-        self.ensure_image(&image).await?;
         self.networks().await?;
+        self.run_fence_batch(FENCE_RULES).await?;
+        let ports = if cfg!(target_os = "linux") {
+            self.host_service_ports.as_slice()
+        } else {
+            &[]
+        };
+        self.replace_host_services(ports).await?;
+        tracing::info!(
+            event = "container_bridges_fenced",
+            bridges = format!("{OPEN_BRIDGE},{INTERNAL_BRIDGE}"),
+            host_service_ports = ?ports,
+            "container bridges deny private forwarding and undeclared host services"
+        );
+        *fenced = true;
+        Ok(())
+    }
+
+    async fn bridge_gateways(&self) -> anyhow::Result<&[BridgeGateway]> {
+        self.bridge_gateways
+            .get_or_try_init(|| async {
+                let (open, internal) = self.networks().await?;
+                let mut gateways = Vec::new();
+                for (network, bridge) in [(open, OPEN_BRIDGE), (internal, INTERNAL_BRIDGE)] {
+                    let info = self
+                        .docker
+                        .expect(
+                            "GET",
+                            &format!("/networks/{network}"),
+                            None,
+                            "inspect container bridge",
+                        )
+                        .await?
+                        .json()?;
+                    let address = info
+                        .pointer("/IPAM/Config")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|config| config.get("Gateway").and_then(Value::as_str))
+                        .find_map(|address| address.parse::<Ipv4Addr>().ok())
+                        .ok_or_else(|| anyhow!("container bridge {network} has no IPv4 gateway"))?;
+                    gateways.push(BridgeGateway { bridge, address });
+                }
+                Ok(gateways)
+            })
+            .await
+            .map(Vec::as_slice)
+    }
+
+    async fn replace_host_services(&self, ports: &[u16]) -> anyhow::Result<()> {
+        let table = self
+            .run_fence("nft -j -a list table inet celld", None)
+            .await?;
+        let table: Value =
+            serde_json::from_str(&table).context("read container fence ownership")?;
+        let set = self.host_service_owner.as_str();
+        let entries = table
+            .get("nftables")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("container fence has no nftables records"))?;
+        let mut batch = String::new();
+        let mut set_exists = false;
+        for entry in entries {
+            if entry
+                .get("set")
+                .and_then(|set| set.get("name"))
+                .and_then(Value::as_str)
+                == Some(set)
+            {
+                set_exists = true;
+            }
+            let Some(rule) = entry.get("rule") else {
+                continue;
+            };
+            if rule.get("chain").and_then(Value::as_str) == Some("host_services")
+                && rule.get("comment").and_then(Value::as_str) == Some(set)
+            {
+                let handle = rule
+                    .get("handle")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("host-service rule has no handle"))?;
+                batch.push_str(&format!(
+                    "delete rule inet celld host_services handle {handle}\n"
+                ));
+            }
+        }
+        if ports.is_empty() {
+            if set_exists {
+                batch.push_str(&format!("delete set inet celld {set}\n"));
+            }
+        } else {
+            batch.push_str(&format!("add set inet celld {set} {{ type ifname . ipv4_addr . inet_service; }}\nflush set inet celld {set}\n"));
+            for gateway in self.bridge_gateways().await? {
+                for port in ports {
+                    batch.push_str(&format!(
+                        "add element inet celld {set} {{ \"{}\" . {} . {port} }}\n",
+                        gateway.bridge, gateway.address
+                    ));
+                }
+            }
+            batch.push_str(&format!("add rule inet celld host_services iifname . ip daddr . tcp dport @{set} accept comment \"{set}\"\n"));
+        }
+        if !batch.is_empty() {
+            self.run_fence_batch(&batch).await?;
+        }
+        Ok(())
+    }
+
+    async fn revoke_host_services(&self) -> anyhow::Result<()> {
+        let mut fenced = self.fenced.lock().await;
+        if *fenced {
+            self.replace_host_services(&[]).await?;
+            *fenced = false;
+        }
+        Ok(())
+    }
+
+    async fn run_fence_batch(&self, batch: &str) -> anyhow::Result<()> {
+        self.run_fence("printf '%s' \"$CELLD_NFT\" | nft -f -", Some(batch))
+            .await?;
+        Ok(())
+    }
+
+    async fn fence_executor(&self) -> anyhow::Result<&FenceExecutor> {
+        let executor = self
+            .fence_executor
+            .get_or_try_init(|| self.resolve_fence_executor())
+            .await?;
+        if let Some(stored) = read_fence_executor(&self.data_dir)? {
+            if stored.image != executor.image || stored.reference != executor.reference {
+                return Err(anyhow!(
+                    "owned fence executor changed while this node was running"
+                ));
+            }
+        } else {
+            let fs = asyncrt::fs();
+            let pending = self.data_dir.join(FENCE_RECEIPT_PENDING);
+            match fs.remove_file(&pending) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("remove incomplete owned fence receipt"),
+            }
+            fs.write_private(&pending, &serde_json::to_vec(executor)?)
+                .context("write owned fence executor")?;
+            fs.sync_all(&pending).context("sync owned fence executor")?;
+            fs.rename(&pending, &self.data_dir.join(FENCE_RECEIPT))
+                .context("commit owned fence executor")?;
+            fs.sync_all(&self.data_dir)
+                .context("sync fence executor directory")?;
+        }
+        Ok(executor)
+    }
+
+    async fn resolve_fence_executor(&self) -> anyhow::Result<FenceExecutor> {
+        if let Some(executor) = read_fence_executor(&self.data_dir)? {
+            let present = self
+                .docker
+                .call("GET", &format!("/images/{}/json", executor.image), None)
+                .await?;
+            if !present.status.is_success() {
+                self.ensure_image(&executor.reference).await?;
+            }
+            let info = self
+                .docker
+                .expect(
+                    "GET",
+                    &format!("/images/{}/json", executor.image),
+                    None,
+                    "inspect owned fence image",
+                )
+                .await?
+                .json()?;
+            if info.get("Id").and_then(Value::as_str) != Some(executor.image.as_str()) {
+                return Err(anyhow!(
+                    "owned fence image does not match its immutable identity"
+                ));
+            }
+            return Ok(executor);
+        }
+        let reference = self.fence_reference.as_ref().ok_or_else(|| anyhow!(
+            "this deployment has no fence image or owned cleanup receipt; deploy it again with this celld"
+        ))?;
+        if !immutable_image(reference, "celld-image:") {
+            return Err(anyhow!(
+                "the fence image reference is not content-addressed"
+            ));
+        }
+        self.ensure_image(reference).await?;
+        let info = self
+            .docker
+            .expect(
+                "GET",
+                &format!("/images/{reference}/json"),
+                None,
+                "inspect fence image identity",
+            )
+            .await?
+            .json()?;
+        let image = info
+            .get("Id")
+            .and_then(Value::as_str)
+            .filter(|image| immutable_image(image, "sha256:"))
+            .ok_or_else(|| anyhow!("the fence image has no immutable Docker identity"))?
+            .to_string();
+        Ok(FenceExecutor {
+            version: 1,
+            reference: reference.clone(),
+            image,
+        })
+    }
+
+    async fn run_fence(&self, command: &str, batch: Option<&str>) -> anyhow::Result<String> {
+        let executor = self.fence_executor().await?;
+        let env: Vec<String> = batch
+            .into_iter()
+            .map(|batch| format!("CELLD_NFT={batch}"))
+            .collect();
         let body = json!({
-            "Image": image,
-            "Env": [format!("CELLD_NFT={FENCE_RULES}")],
-            "Cmd": ["sh", "-c", "printf '%s' \"$CELLD_NFT\" | nft -f -"],
-            "Labels": { "celld.node": self.node, "celld.fence": "1" },
+            "Image": executor.image,
+            "Env": env,
+            "Cmd": ["sh", "-ec", command],
+            "Labels": {
+                "celld.node": self.node,
+                "celld.fence": "1",
+                "celld.host-service-owner": self.host_service_owner,
+            },
             "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
         });
         let created = self
@@ -780,21 +1247,29 @@ impl ContainerEngine {
                     logs.trim()
                 ));
             }
-            Ok(())
+            self.logs(&id).await
         }
         .await;
-        let _ = self
+        let removed = self
             .docker
             .call("DELETE", &format!("/containers/{id}?force=true"), None)
             .await;
-        outcome.context("fence the container bridges")?;
-        tracing::info!(
-            event = "container_bridges_fenced",
-            bridges = format!("{OPEN_BRIDGE},{INTERNAL_BRIDGE}"),
-            "containers can reach the Internet and nothing of the node's own"
-        );
-        *fenced = true;
-        Ok(())
+        let cleanup = match removed {
+            Ok(reply) if reply.status.is_success() || reply.status.as_u16() == 404 => Ok(()),
+            Ok(reply) => Err(anyhow!(
+                "remove owned fence helper {id}: {}",
+                reply.message()
+            )),
+            Err(error) => Err(error.context(format!("remove owned fence helper {id}"))),
+        };
+        match (outcome, cleanup) {
+            (Ok(logs), Ok(())) => Ok(logs),
+            (Err(error), Ok(())) => Err(error.context("update the container fence")),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => Err(anyhow!(
+                "update the container fence: {error:#}; {cleanup:#}"
+            )),
+        }
     }
 
     /// Both output streams of a stopped container, for an error message.
@@ -833,6 +1308,8 @@ impl ContainerEngine {
                     spec,
                     state: Mutex::new(CellState::default()),
                     processes: Mutex::new(Vec::new()),
+                    egress: tokio::sync::Mutex::new(None),
+                    started: watch::channel(None).0,
                     exit: watch::channel(None).0,
                     created: watch::channel(0).0,
                 })
@@ -856,6 +1333,10 @@ impl ContainerEngine {
         state.running = running.is_some();
         state.address = running.unwrap_or_default();
         drop(state);
+        if adopted {
+            cell.started
+                .send_replace(Some((cell.current_run(), Ok(()))));
+        }
         Ok(cell)
     }
 
@@ -1043,11 +1524,15 @@ impl ContainerEngine {
                     error = %format!("{error:#}"),
                     "the container did not start"
                 );
-                let mut state = cell.state.lock().unwrap();
-                state.running = false;
-                drop(state);
+                {
+                    let mut state = cell.state.lock().unwrap();
+                    state.running = false;
+                }
                 cell.exit
                     .send_replace(Some((run, Err(format!("{error:#}")))));
+                cell.started
+                    .send_replace(Some((run, Err(format!("{error:#}")))));
+                egress::stop(&self.docker, cell, cell.current_run()).await?;
                 return Err(error);
             }
         };
@@ -1057,6 +1542,7 @@ impl ContainerEngine {
             state.address = address;
         }
         self.watch_exit(cell, run);
+        cell.started.send_replace(Some((run, Ok(()))));
         Ok(())
     }
 
@@ -1084,12 +1570,20 @@ impl ContainerEngine {
                         .ok_or_else(|| anyhow!("wait answered without a status code"))
                 })
                 .map_err(|error| format!("{error:#}"));
-            let mut state = cell_.state.lock().unwrap();
-            if state.run == run {
-                state.running = false;
-                state.address = Address::None;
+            let ended_current = {
+                let mut state = cell_.state.lock().unwrap();
+                let ended_current = state.run == run;
+                if ended_current {
+                    state.running = false;
+                    state.address = Address::None;
+                }
+                ended_current
+            };
+            if ended_current {
+                if let Err(error) = egress::stop(&docker, &cell_, run).await {
+                    tracing::error!(%error, "remove stopped HTTP intercept");
+                }
             }
-            drop(state);
             cell_.exit.send_replace(Some((run, result)));
         })
         .detach();
@@ -1128,6 +1622,12 @@ impl ContainerEngine {
         labels.insert("celld.node".into(), json!(self.node));
         labels.insert("celld.cell".into(), json!(cell.scope));
         labels.insert("celld.class".into(), json!(cell.spec.class_name));
+        if !self.host_service_ports.is_empty() {
+            labels.insert(
+                "celld.host-service-owner".into(),
+                json!(self.host_service_owner),
+            );
+        }
         for (name, value) in &params.labels {
             labels.insert(format!("celld.user.{name}"), json!(value));
         }
@@ -1159,6 +1659,52 @@ impl ContainerEngine {
             // fork bomb left exactly these behind.
             "Init": true,
         });
+        if cfg!(target_os = "linux") && !self.host_service_ports.is_empty() {
+            let bridge = if offline {
+                INTERNAL_BRIDGE
+            } else {
+                OPEN_BRIDGE
+            };
+            let gateway = self
+                .bridge_gateways()
+                .await?
+                .iter()
+                .find(|gateway| gateway.bridge == bridge)
+                .ok_or_else(|| anyhow!("container bridge {bridge} has no gateway"))?;
+            host_config["ExtraHosts"] =
+                json!([format!("host.docker.internal:{}", gateway.address)]);
+        }
+        let mut mounts = Vec::new();
+        for destination in &cell.spec.local_persistent_directories {
+            let identity = json!([self.volume_namespace, cell.scope, destination]);
+            let digest = Sha256::digest(identity.to_string().as_bytes());
+            let name = format!("celld-local-{digest:x}");
+            self.docker
+                .expect(
+                    "POST",
+                    "/volumes/create",
+                    Some(json!({
+                        "Name": name,
+                        "Labels": {
+                            "celld.node": self.node,
+                            "celld.cell": cell.scope,
+                            "celld.class": cell.spec.class_name,
+                            "celld.local-directory": destination,
+                            "celld.local-installation": self.volume_namespace,
+                        },
+                    })),
+                    "create local persistent volume",
+                )
+                .await?;
+            mounts.push(json!({
+                "Type": "volume",
+                "Source": name,
+                "Target": destination,
+            }));
+        }
+        if !mounts.is_empty() {
+            host_config["Mounts"] = json!(mounts);
+        }
         // A class can name its own runtime, else the node default. A class
         // that needs isolation names `runsc`, and the node's daemon must
         // have it or the start fails, so the class runs only where its
@@ -1203,6 +1749,13 @@ impl ContainerEngine {
             "Labels": labels,
             "HostConfig": host_config,
         });
+        if let Some(binding) = cell.egress.lock().await.as_ref() {
+            binding.run.store(cell.current_run(), Ordering::Release);
+            let main_network = if offline { &internal } else { &open };
+            body["NetworkingConfig"] = json!({"EndpointsConfig": {
+                main_network: {}, binding.network.as_str(): {},
+            }});
+        }
         if let Some(entrypoint) = params.entrypoint {
             body["Cmd"] = json!(entrypoint);
         }
@@ -1290,6 +1843,7 @@ impl ContainerEngine {
     }
 
     pub async fn destroy(&self, cell: &Arc<CellContainer>) -> anyhow::Result<()> {
+        egress::stop(&self.docker, cell, cell.current_run()).await?;
         // Kill first so the wait task reports 137 before the removal makes
         // the name disappear under it.
         let _ = self
@@ -1379,6 +1933,23 @@ impl ContainerEngine {
     ) -> anyhow::Result<Arc<ExecProcess>> {
         if !cell.running() {
             return Err(anyhow!("exec() requires a running container."));
+        }
+        // start() returns before Docker creates the container. Queue the
+        // first exec behind that exact run without retrying the command.
+        let run = cell.current_run();
+        let mut started = cell.started.subscribe();
+        loop {
+            if let Some((started_run, result)) = started.borrow_and_update().clone() {
+                if started_run != run {
+                    return Err(anyhow!("the container restarted before exec()"));
+                }
+                result.map_err(anyhow::Error::msg)?;
+                break;
+            }
+            started
+                .changed()
+                .await
+                .context("the container engine went away")?;
         }
         let mut body = json!({
             "AttachStdin": true,

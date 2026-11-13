@@ -8,7 +8,7 @@
 
 use crate::bucket::Bucket;
 use crate::{deploy, fleet};
-use anyhow::{bail, Context as _};
+use anyhow::{anyhow, bail, Context as _};
 use glob::{MatchOptions, Pattern};
 use notify::{RecursiveMode, Watcher as _};
 use nu_ansi_term::{Color, Style};
@@ -644,7 +644,7 @@ async fn run_stack(
                 bail!("the local celld node exited with {status}");
             }
             NodeEvent::Shutdown => {
-                stop_running_node(running).await;
+                stop_running_node(running).await?;
                 return Ok(());
             }
             NodeEvent::Reload => {
@@ -654,7 +654,7 @@ async fn run_stack(
                     continue;
                 }
                 console.progress("restarting the application");
-                stop_running_node(running).await;
+                stop_running_node(running).await?;
                 running = start_node(
                     state,
                     options.listener,
@@ -673,6 +673,7 @@ struct RunningNode {
     child: Child,
     internal: String,
     output: tokio::task::JoinHandle<()>,
+    state: PathBuf,
 }
 
 enum NodeEvent {
@@ -790,28 +791,42 @@ async fn start_node(
     let internal = match tokio::time::timeout(Duration::from_secs(30), internal_rx).await {
         Ok(Ok(internal)) => internal,
         result => {
-            stop_child(&mut child, None).await;
+            let cleanup = stop_child(&mut child, None).await;
             let _ = output.await;
-            match result {
-                Err(_) => bail!("the local node did not announce its operator listener"),
+            let error = match result {
+                Err(_) => anyhow!("the local node did not announce its operator listener"),
                 Ok(Err(_)) => {
-                    bail!("the local node exited before it announced its operator listener")
+                    anyhow!("the local node exited before it announced its operator listener")
                 }
                 Ok(Ok(_)) => unreachable!(),
-            }
+            };
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => error.context(format!(
+                    "cleanup of {} failed: {cleanup:#}",
+                    state.display()
+                )),
+            });
         }
     };
 
     if let Err(error) = wait_for_node(&mut child, listener).await {
-        stop_child(&mut child, Some(&internal)).await;
+        let cleanup = stop_child(&mut child, Some(&internal)).await;
         let _ = output.await;
-        return Err(error);
+        return Err(match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => error.context(format!(
+                "cleanup of {} failed: {cleanup:#}",
+                state.display()
+            )),
+        });
     }
     console.ready(&format!("http://{listener}"));
     Ok(RunningNode {
         child,
         internal,
         output,
+        state: state.to_path_buf(),
     })
 }
 
@@ -878,13 +893,19 @@ async fn wait_for_project_change(watcher: Option<&mut ProjectWatcher>) -> anyhow
     }
 }
 
-async fn stop_running_node(mut running: RunningNode) {
-    stop_child(&mut running.child, Some(&running.internal)).await;
+async fn stop_running_node(mut running: RunningNode) -> anyhow::Result<()> {
+    let cleanup = stop_child(&mut running.child, Some(&running.internal)).await;
     let _ = running.output.await;
+    cleanup.with_context(|| {
+        format!(
+            "local node cleanup failed for {}; keep its host-service ports owned",
+            running.state.display()
+        )
+    })
 }
 
 #[allow(clippy::disallowed_methods)] // Shutdown deadlines govern a real child process.
-async fn stop_child(child: &mut Child, internal: Option<&str>) {
+async fn stop_child(child: &mut Child, internal: Option<&str>) -> anyhow::Result<()> {
     let requested = if let Some(internal) = internal {
         match reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
@@ -911,8 +932,20 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
             }
         }
     }
-    let waited = tokio::time::timeout(Duration::from_secs(35), child.wait()).await;
-    if waited.is_err() {
-        let _ = child.kill().await;
+    let status = match tokio::time::timeout(Duration::from_secs(35), child.wait()).await {
+        Ok(status) => status.context("wait for local node cleanup")?,
+        Err(_) => {
+            child
+                .kill()
+                .await
+                .context("kill local node after its cleanup deadline")?;
+            bail!(
+                "local node cleanup exceeded its deadline; host-service revocation is unconfirmed"
+            );
+        }
+    };
+    if !status.success() {
+        bail!("local node cleanup exited with {status}; host-service revocation is unconfirmed");
     }
+    Ok(())
 }

@@ -29,7 +29,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: macos-15
+          - runner: macos-26
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -97,6 +97,13 @@ jobs:
             node crates/celld/tests/tcp_ownership.mjs target/release/celld \
             2>&1 | tee out/tcp-ownership.log
 
+      - name: Check unbundled module inventory on candidate bytes
+        run: |
+          set -euo pipefail
+          npm exec --yes --package=esbuild@0.25.12 -- \
+            node crates/celld/tests/unbundled_modules.mjs target/release/celld \
+            2>&1 | tee out/unbundled-modules.log
+
       - name: Check Docker runtime on candidate bytes
         if: runner.os == 'Linux'
         run: |
@@ -107,6 +114,22 @@ jobs:
           npm exec --yes --package=esbuild@0.25.12 -- \
             node crates/celld/tests/container_inspect.mjs target/release/celld \
             2>&1 | tee -a out/container-images.log
+
+      - name: Check operator host-service grants on candidate bytes
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          npm exec --yes --package=esbuild@0.25.12 -- \
+            node crates/celld/tests/container_host_services.mjs target/release/celld \
+            2>&1 | tee out/container-host-services.log
+
+      - name: Check shared container capabilities on candidate bytes
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          npm exec --yes --package=esbuild@0.25.12 -- \
+            node crates/celld/tests/shared_container.mjs target/release/celld \
+            2>&1 | tee out/shared-container.log
 
       - name: Package exact bytes and input manifest
         env:
@@ -154,6 +177,7 @@ jobs:
                   {'name': 'retained Rust compatibility cases', 'outcome': 'passed', 'evidence': 'rust-tests.log', 'evidenceSHA256': digest('out/rust-tests.log')},
                   {'name': 'concurrent storage transactions on candidate bytes', 'outcome': 'passed', 'evidence': 'storage-transactions.log', 'evidenceSHA256': digest('out/storage-transactions.log')},
                   {'name': 'TCP connect, startTLS and R2 body resource ownership on candidate bytes', 'outcome': 'passed', 'evidence': 'tcp-ownership.log', 'evidenceSHA256': digest('out/tcp-ownership.log')},
+                  {'name': 'ordinary unbundled ESM and Wasm inventory on candidate bytes', 'outcome': 'passed', 'evidence': 'unbundled-modules.log', 'evidenceSHA256': digest('out/unbundled-modules.log')},
               ],
               'publication': 'not published; CI candidate artifact only',
           }
@@ -162,6 +186,17 @@ jobs:
           if target.endswith('-linux-gnu'):
               manifest['runtimeCheckTools']['docker'] = command('docker', 'version', '--format', '{{.Server.Version}}')
               manifest['checks'].append({'name': 'Docker image and live container identities on candidate bytes', 'outcome': 'passed', 'evidence': 'container-images.log', 'evidenceSHA256': digest('out/container-images.log')})
+              manifest['checks'].append({'name': 'shared container files, execution, intercept and RPC on candidate bytes', 'outcome': 'passed', 'evidence': 'shared-container.log', 'evidenceSHA256': digest('out/shared-container.log')})
+              manifest['checks'].append({'name': 'operator-scoped host-service grants and cleanup on candidate bytes', 'outcome': 'passed', 'evidence': 'container-host-services.log', 'evidenceSHA256': digest('out/container-host-services.log')})
+          elif target.endswith('-apple-darwin'):
+              manifest['externalQualification'] = {
+                  'name': 'macOS Docker host-service and shared container checks on candidate bytes',
+                  'outcome': 'pending',
+                  'requiredBeforeRelease': True,
+                  'binarySHA256': manifest['binarySHA256'],
+                  'fixtures': ['crates/celld/tests/container_host_services.mjs', 'crates/celld/tests/shared_container.mjs'],
+                  'evidence': None,
+              }
           pathlib.Path(f'out/manifest-{target}.json').write_text(json.dumps(manifest, indent=2) + '\n')
           PY
 
