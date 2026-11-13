@@ -2,13 +2,13 @@
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { copyFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const binary = resolve(process.argv[2] || 'target/debug/celld');
-const directory = await mkdtemp(join(tmpdir(), 'celld-shared-'));
+const directory = await realpath(await mkdtemp(join(tmpdir(), 'celld-shared-')));
 const token = randomUUID();
 const docker = process.env.CELLD_DOCKER || 'docker';
 const dockerRead = args => execFileSync(docker, args, { encoding: 'utf8' }).trim();

@@ -190,11 +190,11 @@ jobs:
               manifest['checks'].append({'name': 'operator-scoped host-service grants and cleanup on candidate bytes', 'outcome': 'passed', 'evidence': 'container-host-services.log', 'evidenceSHA256': digest('out/container-host-services.log')})
           elif target.endswith('-apple-darwin'):
               manifest['externalQualification'] = {
-                  'name': 'macOS Docker host-service grants and cleanup on candidate bytes',
+                  'name': 'macOS Docker host-service and shared container checks on candidate bytes',
                   'outcome': 'pending',
                   'requiredBeforeRelease': True,
                   'binarySHA256': manifest['binarySHA256'],
-                  'fixture': 'crates/celld/tests/container_host_services.mjs',
+                  'fixtures': ['crates/celld/tests/container_host_services.mjs', 'crates/celld/tests/shared_container.mjs'],
                   'evidence': None,
               }
           pathlib.Path(f'out/manifest-{target}.json').write_text(json.dumps(manifest, indent=2) + '\n')
